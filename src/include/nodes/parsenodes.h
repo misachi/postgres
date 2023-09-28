@@ -2523,6 +2523,7 @@ typedef struct CreateStmt
 	char	   *tablespacename; /* table space to use, or NULL */
 	char	   *accessMethod;	/* table access method */
 	bool		if_not_exists;	/* just do nothing if it already exists? */
+	bool 		is_immutable;
 } CreateStmt;
 
 /* ----------
