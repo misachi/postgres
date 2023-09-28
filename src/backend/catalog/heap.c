@@ -91,7 +91,8 @@ static void AddNewRelationTuple(Relation pg_class_desc,
 								TransactionId relfrozenxid,
 								TransactionId relminmxid,
 								Datum relacl,
-								Datum reloptions);
+								Datum reloptions,
+								bool isimmutable);
 static ObjectAddress AddNewRelationType(const char *typeName,
 										Oid typeNamespace,
 										Oid new_rel_oid,
@@ -921,6 +922,7 @@ InsertPgClassTuple(Relation pg_class_desc,
 	values[Anum_pg_class_relispopulated - 1] = BoolGetDatum(rd_rel->relispopulated);
 	values[Anum_pg_class_relreplident - 1] = CharGetDatum(rd_rel->relreplident);
 	values[Anum_pg_class_relispartition - 1] = BoolGetDatum(rd_rel->relispartition);
+	values[Anum_pg_class_relisimmutable - 1] = BoolGetDatum(rd_rel->relisimmutable);
 	values[Anum_pg_class_relrewrite - 1] = ObjectIdGetDatum(rd_rel->relrewrite);
 	values[Anum_pg_class_relfrozenxid - 1] = TransactionIdGetDatum(rd_rel->relfrozenxid);
 	values[Anum_pg_class_relminmxid - 1] = MultiXactIdGetDatum(rd_rel->relminmxid);
@@ -962,7 +964,8 @@ AddNewRelationTuple(Relation pg_class_desc,
 					TransactionId relfrozenxid,
 					TransactionId relminmxid,
 					Datum relacl,
-					Datum reloptions)
+					Datum reloptions,
+					bool isimmutable)
 {
 	Form_pg_class new_rel_reltup;
 
@@ -996,6 +999,7 @@ AddNewRelationTuple(Relation pg_class_desc,
 	/* fill rd_att's type ID with something sane even if reltype is zero */
 	new_rel_desc->rd_att->tdtypeid = new_type_oid ? new_type_oid : RECORDOID;
 	new_rel_desc->rd_att->tdtypmod = -1;
+	new_rel_reltup->relisimmutable = isimmutable;
 
 	/* Now build and insert the tuple */
 	InsertPgClassTuple(pg_class_desc, new_rel_desc, new_rel_oid,
@@ -1108,7 +1112,8 @@ heap_create_with_catalog(const char *relname,
 						 bool allow_system_table_mods,
 						 bool is_internal,
 						 Oid relrewrite,
-						 ObjectAddress *typaddress)
+						 ObjectAddress *typaddress,
+						 bool isimmutable)
 {
 	Relation	pg_class_desc;
 	Relation	new_rel_desc;
@@ -1396,7 +1401,8 @@ heap_create_with_catalog(const char *relname,
 						relfrozenxid,
 						relminmxid,
 						PointerGetDatum(relacl),
-						reloptions);
+						reloptions,
+						isimmutable);
 
 	/*
 	 * now add tuples to pg_attribute for the attributes in our new relation.
