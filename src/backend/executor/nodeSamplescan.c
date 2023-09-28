@@ -3,7 +3,7 @@
  * nodeSamplescan.c
  *	  Support routines for sample scans of relations (table sampling).
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,6 +17,7 @@
 #include "access/relscan.h"
 #include "access/tableam.h"
 #include "access/tsmapi.h"
+#include "common/pg_prng.h"
 #include "executor/executor.h"
 #include "executor/nodeSamplescan.h"
 #include "miscadmin.h"
@@ -154,7 +155,7 @@ ExecInitSampleScan(SampleScan *node, EState *estate, int eflags)
 	 * do this just once, since the seed shouldn't change over rescans.
 	 */
 	if (tsc->repeatable == NULL)
-		scanstate->seed = random();
+		scanstate->seed = pg_prng_uint32(&pg_global_prng_state);
 
 	/*
 	 * Finally, initialize the TABLESAMPLE method handler.
@@ -186,18 +187,6 @@ ExecEndSampleScan(SampleScanState *node)
 	 */
 	if (node->tsmroutine->EndSampleScan)
 		node->tsmroutine->EndSampleScan(node);
-
-	/*
-	 * Free the exprcontext
-	 */
-	ExecFreeExprContext(&node->ss.ps);
-
-	/*
-	 * clean out the tuple table
-	 */
-	if (node->ss.ps.ps_ResultTupleSlot)
-		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 
 	/*
 	 * close heap scan

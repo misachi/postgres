@@ -4,7 +4,7 @@
  *	  routines for handling GIN posting tree pages.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -241,7 +241,7 @@ dataIsMoveRight(GinBtree btree, Page page)
 	if (GinPageIsDeleted(page))
 		return true;
 
-	return (ginCompareItemPointers(&btree->itemptr, iptr) > 0) ? true : false;
+	return (ginCompareItemPointers(&btree->itemptr, iptr) > 0);
 }
 
 /*
@@ -1917,7 +1917,7 @@ ginInsertItemPointers(Relation index, BlockNumber rootBlkno,
 	{
 		/* search for the leaf page where the first item should go to */
 		btree.itemptr = insertdata.items[insertdata.curitem];
-		stack = ginFindLeafPage(&btree, false, true, NULL);
+		stack = ginFindLeafPage(&btree, false, true);
 
 		ginInsertValue(&btree, stack, &insertdata, buildStats);
 	}
@@ -1927,8 +1927,7 @@ ginInsertItemPointers(Relation index, BlockNumber rootBlkno,
  * Starts a new scan on a posting tree.
  */
 GinBtreeStack *
-ginScanBeginPostingTree(GinBtree btree, Relation index, BlockNumber rootBlkno,
-						Snapshot snapshot)
+ginScanBeginPostingTree(GinBtree btree, Relation index, BlockNumber rootBlkno)
 {
 	GinBtreeStack *stack;
 
@@ -1936,7 +1935,7 @@ ginScanBeginPostingTree(GinBtree btree, Relation index, BlockNumber rootBlkno,
 
 	btree->fullScan = true;
 
-	stack = ginFindLeafPage(btree, true, false, snapshot);
+	stack = ginFindLeafPage(btree, true, false);
 
 	return stack;
 }

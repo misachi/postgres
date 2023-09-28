@@ -3,7 +3,7 @@
  * pg_visibility.c
  *	  display visibility map information and page-level visibility bits
  *
- * Copyright (c) 2016-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2023, PostgreSQL Global Development Group
  *
  *	  contrib/pg_visibility/pg_visibility.c
  *-------------------------------------------------------------------------
@@ -13,6 +13,7 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/visibilitymap.h"
+#include "access/xloginsert.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage_xlog.h"
 #include "funcapi.h"
@@ -74,7 +75,7 @@ pg_visibility_map(PG_FUNCTION_ARGS)
 	Buffer		vmbuffer = InvalidBuffer;
 	TupleDesc	tupdesc;
 	Datum		values[2];
-	bool		nulls[2];
+	bool		nulls[2] = {0};
 
 	rel = relation_open(relid, AccessShareLock);
 
@@ -87,7 +88,6 @@ pg_visibility_map(PG_FUNCTION_ARGS)
 				 errmsg("invalid block number")));
 
 	tupdesc = pg_visibility_tupdesc(false, false);
-	MemSet(nulls, 0, sizeof(nulls));
 
 	mapbits = (int32) visibilitymap_get_status(rel, blkno, &vmbuffer);
 	if (vmbuffer != InvalidBuffer)
@@ -116,7 +116,7 @@ pg_visibility(PG_FUNCTION_ARGS)
 	Page		page;
 	TupleDesc	tupdesc;
 	Datum		values[3];
-	bool		nulls[3];
+	bool		nulls[3] = {0};
 
 	rel = relation_open(relid, AccessShareLock);
 
@@ -129,7 +129,6 @@ pg_visibility(PG_FUNCTION_ARGS)
 				 errmsg("invalid block number")));
 
 	tupdesc = pg_visibility_tupdesc(false, true);
-	MemSet(nulls, 0, sizeof(nulls));
 
 	mapbits = (int32) visibilitymap_get_status(rel, blkno, &vmbuffer);
 	if (vmbuffer != InvalidBuffer)
@@ -187,10 +186,9 @@ pg_visibility_map_rel(PG_FUNCTION_ARGS)
 	if (info->next < info->count)
 	{
 		Datum		values[3];
-		bool		nulls[3];
+		bool		nulls[3] = {0};
 		HeapTuple	tuple;
 
-		MemSet(nulls, 0, sizeof(nulls));
 		values[0] = Int64GetDatum(info->next);
 		values[1] = BoolGetDatum((info->bits[info->next] & (1 << 0)) != 0);
 		values[2] = BoolGetDatum((info->bits[info->next] & (1 << 1)) != 0);
@@ -232,10 +230,9 @@ pg_visibility_rel(PG_FUNCTION_ARGS)
 	if (info->next < info->count)
 	{
 		Datum		values[4];
-		bool		nulls[4];
+		bool		nulls[4] = {0};
 		HeapTuple	tuple;
 
-		MemSet(nulls, 0, sizeof(nulls));
 		values[0] = Int64GetDatum(info->next);
 		values[1] = BoolGetDatum((info->bits[info->next] & (1 << 0)) != 0);
 		values[2] = BoolGetDatum((info->bits[info->next] & (1 << 1)) != 0);
@@ -265,7 +262,7 @@ pg_visibility_map_summary(PG_FUNCTION_ARGS)
 	int64		all_frozen = 0;
 	TupleDesc	tupdesc;
 	Datum		values[2];
-	bool		nulls[2];
+	bool		nulls[2] = {0};
 
 	rel = relation_open(relid, AccessShareLock);
 
@@ -294,12 +291,9 @@ pg_visibility_map_summary(PG_FUNCTION_ARGS)
 		ReleaseBuffer(vmbuffer);
 	relation_close(rel, AccessShareLock);
 
-	tupdesc = CreateTemplateTupleDesc(2);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "all_visible", INT8OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "all_frozen", INT8OID, -1, 0);
-	tupdesc = BlessTupleDesc(tupdesc);
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
 
-	MemSet(nulls, 0, sizeof(nulls));
 	values[0] = Int64GetDatum(all_visible);
 	values[1] = Int64GetDatum(all_frozen);
 
@@ -391,14 +385,14 @@ pg_truncate_visibility_map(PG_FUNCTION_ARGS)
 	/* Only some relkinds have a visibility map */
 	check_relation_relkind(rel);
 
-	RelationOpenSmgr(rel);
-	rel->rd_smgr->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] = InvalidBlockNumber;
+	/* Forcibly reset cached file size */
+	RelationGetSmgr(rel)->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] = InvalidBlockNumber;
 
 	block = visibilitymap_prepare_truncate(rel, 0);
 	if (BlockNumberIsValid(block))
 	{
 		fork = VISIBILITYMAP_FORKNUM;
-		smgrtruncate(rel->rd_smgr, &fork, 1, &block);
+		smgrtruncate(RelationGetSmgr(rel), &fork, 1, &block);
 	}
 
 	if (RelationNeedsWAL(rel))
@@ -406,7 +400,7 @@ pg_truncate_visibility_map(PG_FUNCTION_ARGS)
 		xl_smgr_truncate xlrec;
 
 		xlrec.blkno = 0;
-		xlrec.rnode = rel->rd_node;
+		xlrec.rlocator = rel->rd_locator;
 		xlrec.flags = SMGR_TRUNCATE_VM;
 
 		XLogBeginInsert();
@@ -776,11 +770,10 @@ tuple_all_visible(HeapTuple tup, TransactionId OldestXmin, Buffer buffer)
 static void
 check_relation_relkind(Relation rel)
 {
-	if (rel->rd_rel->relkind != RELKIND_RELATION &&
-		rel->rd_rel->relkind != RELKIND_MATVIEW &&
-		rel->rd_rel->relkind != RELKIND_TOASTVALUE)
+	if (!RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("\"%s\" is not a table, materialized view, or TOAST table",
-						RelationGetRelationName(rel))));
+				 errmsg("relation \"%s\" is of wrong relation kind",
+						RelationGetRelationName(rel)),
+				 errdetail_relkind_not_supported(rel->rd_rel->relkind)));
 }

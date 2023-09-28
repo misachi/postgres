@@ -17,7 +17,7 @@
  * the backend's "backend/libpq" is quite separate from "interfaces/libpq".
  * All that remains is similarities of names to trap the unwary...
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *	src/backend/libpq/pqcomm.c
@@ -67,11 +67,9 @@
 #include <sys/time.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#ifdef HAVE_NETINET_TCP_H
 #include <netinet/tcp.h>
-#endif
 #include <utime.h>
-#ifdef _MSC_VER					/* mstcpip.h is missing on mingw */
+#ifdef WIN32
 #include <mstcpip.h>
 #endif
 
@@ -80,7 +78,7 @@
 #include "miscadmin.h"
 #include "port/pg_bswap.h"
 #include "storage/ipc.h"
-#include "utils/guc.h"
+#include "utils/guc_hooks.h"
 #include "utils/memutils.h"
 
 /*
@@ -149,18 +147,16 @@ static void socket_putmessage_noblock(char msgtype, const char *s, size_t len);
 static int	internal_putbytes(const char *s, size_t len);
 static int	internal_flush(void);
 
-#ifdef HAVE_UNIX_SOCKETS
 static int	Lock_AF_UNIX(const char *unixSocketDir, const char *unixSocketPath);
 static int	Setup_AF_UNIX(const char *sock_path);
-#endif							/* HAVE_UNIX_SOCKETS */
 
 static const PQcommMethods PqCommSocketMethods = {
-	socket_comm_reset,
-	socket_flush,
-	socket_flush_if_writable,
-	socket_is_send_pending,
-	socket_putmessage,
-	socket_putmessage_noblock
+	.comm_reset = socket_comm_reset,
+	.flush = socket_flush,
+	.flush_if_writable = socket_flush_if_writable,
+	.is_send_pending = socket_is_send_pending,
+	.putmessage = socket_putmessage,
+	.putmessage_noblock = socket_putmessage_noblock
 };
 
 const PQcommMethods *PqCommMethods = &PqCommSocketMethods;
@@ -204,7 +200,14 @@ pq_init(void)
 				(errmsg("could not set socket to nonblocking mode: %m")));
 #endif
 
-	FeBeWaitSet = CreateWaitEventSet(TopMemoryContext, 3);
+#ifndef WIN32
+
+	/* Don't give the socket to any subprograms we execute. */
+	if (fcntl(MyProcPort->sock, F_SETFD, FD_CLOEXEC) < 0)
+		elog(FATAL, "fcntl(F_SETFD) failed on socket: %m");
+#endif
+
+	FeBeWaitSet = CreateWaitEventSet(TopMemoryContext, FeBeWaitSetNEvents);
 	socket_pos = AddWaitEventToSet(FeBeWaitSet, WL_SOCKET_WRITEABLE,
 								   MyProcPort->sock, NULL, NULL);
 	latch_pos = AddWaitEventToSet(FeBeWaitSet, WL_LATCH_SET, PGINVALID_SOCKET,
@@ -334,10 +337,7 @@ StreamServerPort(int family, const char *hostName, unsigned short portNumber,
 	struct addrinfo hint;
 	int			listen_index = 0;
 	int			added = 0;
-
-#ifdef HAVE_UNIX_SOCKETS
 	char		unixSocketPath[MAXPGPATH];
-#endif
 #if !defined(WIN32) || defined(IPV6_V6ONLY)
 	int			one = 1;
 #endif
@@ -348,7 +348,6 @@ StreamServerPort(int family, const char *hostName, unsigned short portNumber,
 	hint.ai_flags = AI_PASSIVE;
 	hint.ai_socktype = SOCK_STREAM;
 
-#ifdef HAVE_UNIX_SOCKETS
 	if (family == AF_UNIX)
 	{
 		/*
@@ -369,7 +368,6 @@ StreamServerPort(int family, const char *hostName, unsigned short portNumber,
 		service = unixSocketPath;
 	}
 	else
-#endif							/* HAVE_UNIX_SOCKETS */
 	{
 		snprintf(portNumberStr, sizeof(portNumberStr), "%d", portNumber);
 		service = portNumberStr;
@@ -393,7 +391,7 @@ StreamServerPort(int family, const char *hostName, unsigned short portNumber,
 
 	for (addr = addrs; addr; addr = addr->ai_next)
 	{
-		if (!IS_AF_UNIX(family) && IS_AF_UNIX(addr->ai_family))
+		if (family != AF_UNIX && addr->ai_family == AF_UNIX)
 		{
 			/*
 			 * Only set up a unix domain socket when they really asked for it.
@@ -422,16 +420,12 @@ StreamServerPort(int family, const char *hostName, unsigned short portNumber,
 			case AF_INET:
 				familyDesc = _("IPv4");
 				break;
-#ifdef HAVE_IPV6
 			case AF_INET6:
 				familyDesc = _("IPv6");
 				break;
-#endif
-#ifdef HAVE_UNIX_SOCKETS
 			case AF_UNIX:
 				familyDesc = _("Unix");
 				break;
-#endif
 			default:
 				snprintf(familyDescBuf, sizeof(familyDescBuf),
 						 _("unrecognized address family %d"),
@@ -441,11 +435,9 @@ StreamServerPort(int family, const char *hostName, unsigned short portNumber,
 		}
 
 		/* set up text form of address for log messages */
-#ifdef HAVE_UNIX_SOCKETS
 		if (addr->ai_family == AF_UNIX)
 			addrDesc = unixSocketPath;
 		else
-#endif
 		{
 			pg_getnameinfo_all((const struct sockaddr_storage *) addr->ai_addr,
 							   addr->ai_addrlen,
@@ -466,6 +458,9 @@ StreamServerPort(int family, const char *hostName, unsigned short portNumber,
 		}
 
 #ifndef WIN32
+		/* Don't give the listen socket to any subprograms we execute. */
+		if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0)
+			elog(FATAL, "fcntl(F_SETFD) failed on socket: %m");
 
 		/*
 		 * Without the SO_REUSEADDR flag, a new postmaster can't be started
@@ -478,7 +473,7 @@ StreamServerPort(int family, const char *hostName, unsigned short portNumber,
 		 * unpredictable behavior. With no flags at all, win32 behaves as Unix
 		 * with SO_REUSEADDR.
 		 */
-		if (!IS_AF_UNIX(addr->ai_family))
+		if (addr->ai_family != AF_UNIX)
 		{
 			if ((setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
 							(char *) &one, sizeof(one))) == -1)
@@ -530,7 +525,7 @@ StreamServerPort(int family, const char *hostName, unsigned short portNumber,
 					 errmsg("could not bind %s address \"%s\": %m",
 							familyDesc, addrDesc),
 					 saved_errno == EADDRINUSE ?
-					 (IS_AF_UNIX(addr->ai_family) ?
+					 (addr->ai_family == AF_UNIX ?
 					  errhint("Is another postmaster already running on port %d?",
 							  (int) portNumber) :
 					  errhint("Is another postmaster already running on port %d?"
@@ -540,7 +535,6 @@ StreamServerPort(int family, const char *hostName, unsigned short portNumber,
 			continue;
 		}
 
-#ifdef HAVE_UNIX_SOCKETS
 		if (addr->ai_family == AF_UNIX)
 		{
 			if (Setup_AF_UNIX(service) != STATUS_OK)
@@ -549,16 +543,13 @@ StreamServerPort(int family, const char *hostName, unsigned short portNumber,
 				break;
 			}
 		}
-#endif
 
 		/*
-		 * Select appropriate accept-queue length limit.  PG_SOMAXCONN is only
-		 * intended to provide a clamp on the request on platforms where an
-		 * overly large request provokes a kernel error (are there any?).
+		 * Select appropriate accept-queue length limit.  It seems reasonable
+		 * to use a value similar to the maximum number of child processes
+		 * that the postmaster will permit.
 		 */
-		maxconn = MaxBackends * 2;
-		if (maxconn > PG_SOMAXCONN)
-			maxconn = PG_SOMAXCONN;
+		maxconn = MaxConnections * 2;
 
 		err = listen(fd, maxconn);
 		if (err < 0)
@@ -572,13 +563,11 @@ StreamServerPort(int family, const char *hostName, unsigned short portNumber,
 			continue;
 		}
 
-#ifdef HAVE_UNIX_SOCKETS
 		if (addr->ai_family == AF_UNIX)
 			ereport(LOG,
 					(errmsg("listening on Unix socket \"%s\"",
 							addrDesc)));
 		else
-#endif
 			ereport(LOG,
 			/* translator: first %s is IPv4 or IPv6 */
 					(errmsg("listening on %s address \"%s\", port %d",
@@ -596,8 +585,6 @@ StreamServerPort(int family, const char *hostName, unsigned short portNumber,
 	return STATUS_OK;
 }
 
-
-#ifdef HAVE_UNIX_SOCKETS
 
 /*
  * Lock_AF_UNIX -- configure unix socket file path
@@ -699,7 +686,6 @@ Setup_AF_UNIX(const char *sock_path)
 	}
 	return STATUS_OK;
 }
-#endif							/* HAVE_UNIX_SOCKETS */
 
 
 /*
@@ -707,8 +693,7 @@ Setup_AF_UNIX(const char *sock_path)
  *		server port.  Set port->sock to the FD of the new connection.
  *
  * ASSUME: that this doesn't need to be non-blocking because
- *		the Postmaster uses select() to tell when the socket is ready for
- *		accept().
+ *		the Postmaster waits for the socket to be ready to accept().
  *
  * RETURNS: STATUS_OK or STATUS_ERROR
  */
@@ -748,7 +733,7 @@ StreamConnection(pgsocket server_fd, Port *port)
 	}
 
 	/* select NODELAY and KEEPALIVE options if it's a TCP connection */
-	if (!IS_AF_UNIX(port->laddr.addr.ss_family))
+	if (port->laddr.addr.ss_family != AF_UNIX)
 	{
 		int			on;
 #ifdef WIN32
@@ -849,7 +834,8 @@ StreamConnection(pgsocket server_fd, Port *port)
 void
 StreamClose(pgsocket sock)
 {
-	closesocket(sock);
+	if (closesocket(sock) != 0)
+		elog(LOG, "could not close client or listen socket: %m");
 }
 
 /*
@@ -1139,6 +1125,18 @@ pq_discardbytes(size_t len)
 		len -= amount;
 	}
 	return 0;
+}
+
+/* --------------------------------
+ *		pq_buffer_has_data		- is any buffered data available to read?
+ *
+ * This will *not* attempt to read more data.
+ * --------------------------------
+ */
+bool
+pq_buffer_has_data(void)
+{
+	return (PqRecvPointer < PqRecvLength);
 }
 
 
@@ -1611,7 +1609,7 @@ int
 pq_getkeepalivesidle(Port *port)
 {
 #if defined(PG_TCP_KEEPALIVE_IDLE) || defined(SIO_KEEPALIVE_VALS)
-	if (port == NULL || IS_AF_UNIX(port->laddr.addr.ss_family))
+	if (port == NULL || port->laddr.addr.ss_family == AF_UNIX)
 		return 0;
 
 	if (port->keepalives_idle != 0)
@@ -1620,7 +1618,7 @@ pq_getkeepalivesidle(Port *port)
 	if (port->default_keepalives_idle == 0)
 	{
 #ifndef WIN32
-		ACCEPT_TYPE_ARG3 size = sizeof(port->default_keepalives_idle);
+		socklen_t	size = sizeof(port->default_keepalives_idle);
 
 		if (getsockopt(port->sock, IPPROTO_TCP, PG_TCP_KEEPALIVE_IDLE,
 					   (char *) &port->default_keepalives_idle,
@@ -1645,7 +1643,7 @@ pq_getkeepalivesidle(Port *port)
 int
 pq_setkeepalivesidle(int idle, Port *port)
 {
-	if (port == NULL || IS_AF_UNIX(port->laddr.addr.ss_family))
+	if (port == NULL || port->laddr.addr.ss_family == AF_UNIX)
 		return STATUS_OK;
 
 /* check SIO_KEEPALIVE_VALS here, not just WIN32, as some toolchains lack it */
@@ -1696,7 +1694,7 @@ int
 pq_getkeepalivesinterval(Port *port)
 {
 #if defined(TCP_KEEPINTVL) || defined(SIO_KEEPALIVE_VALS)
-	if (port == NULL || IS_AF_UNIX(port->laddr.addr.ss_family))
+	if (port == NULL || port->laddr.addr.ss_family == AF_UNIX)
 		return 0;
 
 	if (port->keepalives_interval != 0)
@@ -1705,7 +1703,7 @@ pq_getkeepalivesinterval(Port *port)
 	if (port->default_keepalives_interval == 0)
 	{
 #ifndef WIN32
-		ACCEPT_TYPE_ARG3 size = sizeof(port->default_keepalives_interval);
+		socklen_t	size = sizeof(port->default_keepalives_interval);
 
 		if (getsockopt(port->sock, IPPROTO_TCP, TCP_KEEPINTVL,
 					   (char *) &port->default_keepalives_interval,
@@ -1730,7 +1728,7 @@ pq_getkeepalivesinterval(Port *port)
 int
 pq_setkeepalivesinterval(int interval, Port *port)
 {
-	if (port == NULL || IS_AF_UNIX(port->laddr.addr.ss_family))
+	if (port == NULL || port->laddr.addr.ss_family == AF_UNIX)
 		return STATUS_OK;
 
 #if defined(TCP_KEEPINTVL) || defined(SIO_KEEPALIVE_VALS)
@@ -1780,7 +1778,7 @@ int
 pq_getkeepalivescount(Port *port)
 {
 #ifdef TCP_KEEPCNT
-	if (port == NULL || IS_AF_UNIX(port->laddr.addr.ss_family))
+	if (port == NULL || port->laddr.addr.ss_family == AF_UNIX)
 		return 0;
 
 	if (port->keepalives_count != 0)
@@ -1788,7 +1786,7 @@ pq_getkeepalivescount(Port *port)
 
 	if (port->default_keepalives_count == 0)
 	{
-		ACCEPT_TYPE_ARG3 size = sizeof(port->default_keepalives_count);
+		socklen_t	size = sizeof(port->default_keepalives_count);
 
 		if (getsockopt(port->sock, IPPROTO_TCP, TCP_KEEPCNT,
 					   (char *) &port->default_keepalives_count,
@@ -1809,7 +1807,7 @@ pq_getkeepalivescount(Port *port)
 int
 pq_setkeepalivescount(int count, Port *port)
 {
-	if (port == NULL || IS_AF_UNIX(port->laddr.addr.ss_family))
+	if (port == NULL || port->laddr.addr.ss_family == AF_UNIX)
 		return STATUS_OK;
 
 #ifdef TCP_KEEPCNT
@@ -1855,7 +1853,7 @@ int
 pq_gettcpusertimeout(Port *port)
 {
 #ifdef TCP_USER_TIMEOUT
-	if (port == NULL || IS_AF_UNIX(port->laddr.addr.ss_family))
+	if (port == NULL || port->laddr.addr.ss_family == AF_UNIX)
 		return 0;
 
 	if (port->tcp_user_timeout != 0)
@@ -1863,7 +1861,7 @@ pq_gettcpusertimeout(Port *port)
 
 	if (port->default_tcp_user_timeout == 0)
 	{
-		ACCEPT_TYPE_ARG3 size = sizeof(port->default_tcp_user_timeout);
+		socklen_t	size = sizeof(port->default_tcp_user_timeout);
 
 		if (getsockopt(port->sock, IPPROTO_TCP, TCP_USER_TIMEOUT,
 					   (char *) &port->default_tcp_user_timeout,
@@ -1884,7 +1882,7 @@ pq_gettcpusertimeout(Port *port)
 int
 pq_settcpusertimeout(int timeout, Port *port)
 {
-	if (port == NULL || IS_AF_UNIX(port->laddr.addr.ss_family))
+	if (port == NULL || port->laddr.addr.ss_family == AF_UNIX)
 		return STATUS_OK;
 
 #ifdef TCP_USER_TIMEOUT
@@ -1927,38 +1925,140 @@ pq_settcpusertimeout(int timeout, Port *port)
 }
 
 /*
+ * GUC assign_hook for tcp_keepalives_idle
+ */
+void
+assign_tcp_keepalives_idle(int newval, void *extra)
+{
+	/*
+	 * The kernel API provides no way to test a value without setting it; and
+	 * once we set it we might fail to unset it.  So there seems little point
+	 * in fully implementing the check-then-assign GUC API for these
+	 * variables.  Instead we just do the assignment on demand.
+	 * pq_setkeepalivesidle reports any problems via ereport(LOG).
+	 *
+	 * This approach means that the GUC value might have little to do with the
+	 * actual kernel value, so we use a show_hook that retrieves the kernel
+	 * value rather than trusting GUC's copy.
+	 */
+	(void) pq_setkeepalivesidle(newval, MyProcPort);
+}
+
+/*
+ * GUC show_hook for tcp_keepalives_idle
+ */
+const char *
+show_tcp_keepalives_idle(void)
+{
+	/* See comments in assign_tcp_keepalives_idle */
+	static char nbuf[16];
+
+	snprintf(nbuf, sizeof(nbuf), "%d", pq_getkeepalivesidle(MyProcPort));
+	return nbuf;
+}
+
+/*
+ * GUC assign_hook for tcp_keepalives_interval
+ */
+void
+assign_tcp_keepalives_interval(int newval, void *extra)
+{
+	/* See comments in assign_tcp_keepalives_idle */
+	(void) pq_setkeepalivesinterval(newval, MyProcPort);
+}
+
+/*
+ * GUC show_hook for tcp_keepalives_interval
+ */
+const char *
+show_tcp_keepalives_interval(void)
+{
+	/* See comments in assign_tcp_keepalives_idle */
+	static char nbuf[16];
+
+	snprintf(nbuf, sizeof(nbuf), "%d", pq_getkeepalivesinterval(MyProcPort));
+	return nbuf;
+}
+
+/*
+ * GUC assign_hook for tcp_keepalives_count
+ */
+void
+assign_tcp_keepalives_count(int newval, void *extra)
+{
+	/* See comments in assign_tcp_keepalives_idle */
+	(void) pq_setkeepalivescount(newval, MyProcPort);
+}
+
+/*
+ * GUC show_hook for tcp_keepalives_count
+ */
+const char *
+show_tcp_keepalives_count(void)
+{
+	/* See comments in assign_tcp_keepalives_idle */
+	static char nbuf[16];
+
+	snprintf(nbuf, sizeof(nbuf), "%d", pq_getkeepalivescount(MyProcPort));
+	return nbuf;
+}
+
+/*
+ * GUC assign_hook for tcp_user_timeout
+ */
+void
+assign_tcp_user_timeout(int newval, void *extra)
+{
+	/* See comments in assign_tcp_keepalives_idle */
+	(void) pq_settcpusertimeout(newval, MyProcPort);
+}
+
+/*
+ * GUC show_hook for tcp_user_timeout
+ */
+const char *
+show_tcp_user_timeout(void)
+{
+	/* See comments in assign_tcp_keepalives_idle */
+	static char nbuf[16];
+
+	snprintf(nbuf, sizeof(nbuf), "%d", pq_gettcpusertimeout(MyProcPort));
+	return nbuf;
+}
+
+/*
  * Check if the client is still connected.
  */
 bool
 pq_check_connection(void)
 {
-#if defined(POLLRDHUP)
-	/*
-	 * POLLRDHUP is a Linux extension to poll(2) to detect sockets closed by
-	 * the other end.  We don't have a portable way to do that without
-	 * actually trying to read or write data on other systems.  We don't want
-	 * to read because that would be confused by pipelined queries and COPY
-	 * data. Perhaps in future we'll try to write a heartbeat message instead.
-	 */
-	struct pollfd pollfd;
+	WaitEvent	events[FeBeWaitSetNEvents];
 	int			rc;
 
-	pollfd.fd = MyProcPort->sock;
-	pollfd.events = POLLOUT | POLLIN | POLLRDHUP;
-	pollfd.revents = 0;
+	/*
+	 * It's OK to modify the socket event filter without restoring, because
+	 * all FeBeWaitSet socket wait sites do the same.
+	 */
+	ModifyWaitEvent(FeBeWaitSet, FeBeWaitSetSocketPos, WL_SOCKET_CLOSED, NULL);
 
-	rc = poll(&pollfd, 1, 0);
-
-	if (rc < 0)
+retry:
+	rc = WaitEventSetWait(FeBeWaitSet, 0, events, lengthof(events), 0);
+	for (int i = 0; i < rc; ++i)
 	{
-		ereport(COMMERROR,
-				(errcode_for_socket_access(),
-				 errmsg("could not poll socket: %m")));
-		return false;
+		if (events[i].events & WL_SOCKET_CLOSED)
+			return false;
+		if (events[i].events & WL_LATCH_SET)
+		{
+			/*
+			 * A latch event might be preventing other events from being
+			 * reported.  Reset it and poll again.  No need to restore it
+			 * because no code should expect latches to survive across
+			 * CHECK_FOR_INTERRUPTS().
+			 */
+			ResetLatch(MyLatch);
+			goto retry;
+		}
 	}
-	else if (rc == 1 && (pollfd.revents & (POLLHUP | POLLRDHUP)))
-		return false;
-#endif
 
 	return true;
 }

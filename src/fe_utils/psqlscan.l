@@ -24,7 +24,7 @@
  * See psqlscan_int.h for additional commentary.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -112,7 +112,7 @@ extern void psql_yyset_column(int column_no, yyscan_t yyscanner);
  *  <xb> bit string literal
  *  <xc> extended C-style comments
  *  <xd> delimited identifiers (double-quoted identifiers)
- *  <xh> hexadecimal numeric string
+ *  <xh> hexadecimal byte string
  *  <xq> standard quoted strings
  *  <xqs> quote stop (detect continued strings)
  *  <xe> extended quoted strings (support backslash escape sequences)
@@ -149,16 +149,16 @@ extern void psql_yyset_column(int column_no, yyscan_t yyscanner);
  * versions of Postgres failed to recognize -- as a comment if the input
  * did not end with a newline.
  *
- * XXX perhaps \f (formfeed) should be treated as a newline as well?
+ * non_newline_space tracks all space characters except newlines.
  *
  * XXX if you change the set of whitespace characters, fix scanner_isspace()
  * to agree.
  */
 
-space			[ \t\n\r\f]
-horiz_space		[ \t\f]
-newline			[\n\r]
-non_newline		[^\n\r]
+space				[ \t\n\r\f\v]
+non_newline_space	[ \t\f\v]
+newline				[\n\r]
+non_newline			[^\n\r]
 
 comment			("--"{non_newline}*)
 
@@ -172,8 +172,8 @@ whitespace		({space}+|{comment})
  */
 
 special_whitespace		({space}+|{comment}{newline})
-horiz_whitespace		({horiz_space}|{comment})
-whitespace_with_newline	({horiz_whitespace}*{newline}{special_whitespace}*)
+non_newline_whitespace	({non_newline_space}|{comment})
+whitespace_with_newline	({non_newline_whitespace}*{newline}{special_whitespace}*)
 
 quote			'
 /* If we see {quote} then {quotecontinue}, the quoted string continues */
@@ -200,7 +200,7 @@ quotecontinuefail	{whitespace}*"-"?
 xbstart			[bB]{quote}
 xbinside		[^']*
 
-/* Hexadecimal number */
+/* Hexadecimal byte string */
 xhstart			[xX]{quote}
 xhinside		[^']*
 
@@ -279,7 +279,6 @@ xcstart			\/\*{op_chars}*
 xcstop			\*+\/
 xcinside		[^*/]+
 
-digit			[0-9]
 ident_start		[A-Za-z\200-\377_]
 ident_cont		[A-Za-z\200-\377_0-9\$]
 
@@ -318,24 +317,46 @@ self			[,()\[\].;\:\+\-\*\/\%\^\<\>\=]
 op_chars		[\~\!\@\#\^\&\|\`\?\+\-\*\/\%\<\>\=]
 operator		{op_chars}+
 
-/* we no longer allow unary minus in numbers.
- * instead we pass it separately to parser. there it gets
- * coerced via doNegate() -- Leon aug 20 1999
+/*
+ * Numbers
  *
- * {decimalfail} is used because we would like "1..10" to lex as 1, dot_dot, 10.
+ * Unary minus is not part of a number here.  Instead we pass it separately to
+ * the parser, and there it gets coerced via doNegate().
  *
- * {realfail1} and {realfail2} are added to prevent the need for scanner
+ * {numericfail} is used because we would like "1..10" to lex as 1, dot_dot, 10.
+ *
+ * {realfail} is added to prevent the need for scanner
  * backup when the {real} rule fails to match completely.
  */
+decdigit		[0-9]
+hexdigit		[0-9A-Fa-f]
+octdigit		[0-7]
+bindigit		[0-1]
 
-integer			{digit}+
-decimal			(({digit}*\.{digit}+)|({digit}+\.{digit}*))
-decimalfail		{digit}+\.\.
-real			({integer}|{decimal})[Ee][-+]?{digit}+
-realfail1		({integer}|{decimal})[Ee]
-realfail2		({integer}|{decimal})[Ee][-+]
+decinteger		{decdigit}(_?{decdigit})*
+hexinteger		0[xX](_?{hexdigit})+
+octinteger		0[oO](_?{octdigit})+
+bininteger		0[bB](_?{bindigit})+
 
-param			\${integer}
+hexfail			0[xX]_?
+octfail			0[oO]_?
+binfail			0[bB]_?
+
+numeric			(({decinteger}\.{decinteger}?)|(\.{decinteger}))
+numericfail		{decdigit}+\.\.
+
+real			({decinteger}|{numeric})[Ee][-+]?{decinteger}
+realfail		({decinteger}|{numeric})[Ee][-+]
+
+decinteger_junk	{decinteger}{ident_start}
+hexinteger_junk	{hexinteger}{ident_start}
+octinteger_junk	{octinteger}{ident_start}
+bininteger_junk	{bininteger}{ident_start}
+numeric_junk	{numeric}{ident_start}
+real_junk		{real}{ident_start}
+
+param			\${decinteger}
+param_junk		\${decinteger}{ident_start}
 
 /* psql-specific: characters allowed in variable names */
 variable_char	[A-Za-z\200-\377_0-9]
@@ -376,12 +397,11 @@ other			.
 					/*
 					 * Note that the whitespace rule includes both true
 					 * whitespace and single-line ("--" style) comments.
-					 * We suppress whitespace at the start of the query
-					 * buffer.  We also suppress all single-line comments,
-					 * which is pretty dubious but is the historical
-					 * behavior.
+					 * We suppress whitespace until we have collected some
+					 * non-whitespace data.  (This interacts with some
+					 * decisions in MainLoop(); see there for details.)
 					 */
-					if (!(output_buf->len == 0 || yytext[0] == '-'))
+					if (output_buf->len > 0)
 						ECHO;
 				}
 
@@ -838,14 +858,35 @@ other			.
 {param}			{
 					ECHO;
 				}
+{param_junk}	{
+					ECHO;
+				}
 
-{integer}		{
+{decinteger}	{
 					ECHO;
 				}
-{decimal}		{
+{hexinteger}	{
 					ECHO;
 				}
-{decimalfail}	{
+{octinteger}	{
+					ECHO;
+				}
+{bininteger}	{
+					ECHO;
+				}
+{hexfail}		{
+					ECHO;
+				}
+{octfail}		{
+					ECHO;
+				}
+{binfail}		{
+					ECHO;
+				}
+{numeric}		{
+					ECHO;
+				}
+{numericfail}	{
 					/* throw back the .., and treat as integer */
 					yyless(yyleng - 2);
 					ECHO;
@@ -853,18 +894,25 @@ other			.
 {real}			{
 					ECHO;
 				}
-{realfail1}		{
-					/*
-					 * throw back the [Ee], and figure out whether what
-					 * remains is an {integer} or {decimal}.
-					 * (in psql, we don't actually care...)
-					 */
-					yyless(yyleng - 1);
+{realfail}		{
 					ECHO;
 				}
-{realfail2}		{
-					/* throw back the [Ee][+-], and proceed as above */
-					yyless(yyleng - 2);
+{decinteger_junk}	{
+					ECHO;
+				}
+{hexinteger_junk}	{
+					ECHO;
+				}
+{octinteger_junk}	{
+					ECHO;
+				}
+{bininteger_junk}	{
+					ECHO;
+				}
+{numeric_junk}	{
+					ECHO;
+				}
+{real_junk}		{
 					ECHO;
 				}
 

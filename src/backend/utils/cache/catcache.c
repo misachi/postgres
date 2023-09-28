@@ -3,7 +3,7 @@
  * catcache.c
  *	  System catalog cache for tuples matching a key.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,13 +19,13 @@
 #include "access/relscan.h"
 #include "access/sysattr.h"
 #include "access/table.h"
-#include "access/valid.h"
 #include "access/xact.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "common/hashfn.h"
 #include "miscadmin.h"
+#include "port/pg_bitutils.h"
 #ifdef CATCACHE_STATS
 #include "storage/ipc.h"		/* for on_proc_exit */
 #endif
@@ -239,6 +239,7 @@ GetCCHashEqFuncs(Oid keytype, CCHashFN *hashfunc, RegProcedure *eqfunc, CCFastEq
 		case REGOPERATOROID:
 		case REGCLASSOID:
 		case REGTYPEOID:
+		case REGCOLLATIONOID:
 		case REGCONFIGOID:
 		case REGDICTIONARYOID:
 		case REGROLEOID:
@@ -281,25 +282,18 @@ CatalogCacheComputeHashValue(CatCache *cache, int nkeys,
 	{
 		case 4:
 			oneHash = (cc_hashfunc[3]) (v4);
-
-			hashValue ^= oneHash << 24;
-			hashValue ^= oneHash >> 8;
+			hashValue ^= pg_rotate_left32(oneHash, 24);
 			/* FALLTHROUGH */
 		case 3:
 			oneHash = (cc_hashfunc[2]) (v3);
-
-			hashValue ^= oneHash << 16;
-			hashValue ^= oneHash >> 16;
+			hashValue ^= pg_rotate_left32(oneHash, 16);
 			/* FALLTHROUGH */
 		case 2:
 			oneHash = (cc_hashfunc[1]) (v2);
-
-			hashValue ^= oneHash << 8;
-			hashValue ^= oneHash >> 24;
+			hashValue ^= pg_rotate_left32(oneHash, 8);
 			/* FALLTHROUGH */
 		case 1:
 			oneHash = (cc_hashfunc[0]) (v1);
-
 			hashValue ^= oneHash;
 			break;
 		default:
@@ -769,7 +763,6 @@ InitCatCache(int id,
 {
 	CatCache   *cp;
 	MemoryContext oldcxt;
-	size_t		sz;
 	int			i;
 
 	/*
@@ -813,8 +806,8 @@ InitCatCache(int id,
 	 *
 	 * Note: we rely on zeroing to initialize all the dlist headers correctly
 	 */
-	sz = sizeof(CatCache) + PG_CACHE_LINE_SIZE;
-	cp = (CatCache *) CACHELINEALIGN(palloc0(sz));
+	cp = (CatCache *) palloc_aligned(sizeof(CatCache), PG_CACHE_LINE_SIZE,
+									 MCXT_ALLOC_ZERO);
 	cp->cc_bucket = palloc0(nbuckets * sizeof(dlist_head));
 
 	/*
@@ -832,7 +825,10 @@ InitCatCache(int id,
 	cp->cc_nbuckets = nbuckets;
 	cp->cc_nkeys = nkeys;
 	for (i = 0; i < nkeys; ++i)
+	{
+		Assert(AttributeNumberIsValid(key[i]));
 		cp->cc_keyno[i] = key[i];
+	}
 
 	/*
 	 * new cache is initialized as far as we can go for now. print some
@@ -1716,7 +1712,6 @@ SearchCatCacheList(CatCache *cache,
 		 * we'd better do so before we start marking the members as belonging
 		 * to the list.
 		 */
-
 	}
 	PG_CATCH();
 	{
@@ -1968,7 +1963,6 @@ CatCacheCopyKeys(TupleDesc tupdesc, int nkeys, int *attnos,
 							   att->attbyval,
 							   att->attlen);
 	}
-
 }
 
 /*

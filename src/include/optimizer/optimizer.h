@@ -12,7 +12,7 @@
  * example.  For the most part, however, code outside the core planner
  * should not need to include any optimizer/ header except this one.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/optimizer/optimizer.h
@@ -23,11 +23,6 @@
 #define OPTIMIZER_H
 
 #include "nodes/parsenodes.h"
-
-/* Test if an expression node represents a SRF call.  Beware multiple eval! */
-#define IS_SRF_CALL(node) \
-	((IsA(node, FuncExpr) && ((FuncExpr *) (node))->funcretset) || \
-	 (IsA(node, OpExpr) && ((OpExpr *) (node))->opretset))
 
 /*
  * We don't want to include nodes/pathnodes.h here, because non-planner
@@ -91,9 +86,11 @@ extern PGDLLIMPORT double cpu_index_tuple_cost;
 extern PGDLLIMPORT double cpu_operator_cost;
 extern PGDLLIMPORT double parallel_tuple_cost;
 extern PGDLLIMPORT double parallel_setup_cost;
+extern PGDLLIMPORT double recursive_worktable_factor;
 extern PGDLLIMPORT int effective_cache_size;
 
 extern double clamp_row_est(double nrows);
+extern long clamp_cardinality_to_long(Cardinality x);
 
 /* in path/indxpath.c: */
 
@@ -102,17 +99,17 @@ extern bool is_pseudo_constant_for_index(PlannerInfo *root, Node *expr,
 
 /* in plan/planner.c: */
 
-/* possible values for force_parallel_mode */
+/* possible values for debug_parallel_query */
 typedef enum
 {
-	FORCE_PARALLEL_OFF,
-	FORCE_PARALLEL_ON,
-	FORCE_PARALLEL_REGRESS
-}			ForceParallelMode;
+	DEBUG_PARALLEL_OFF,
+	DEBUG_PARALLEL_ON,
+	DEBUG_PARALLEL_REGRESS
+}			DebugParallelMode;
 
 /* GUC parameters */
-extern int	force_parallel_mode;
-extern bool parallel_leader_participation;
+extern PGDLLIMPORT int debug_parallel_query;
+extern PGDLLIMPORT bool parallel_leader_participation;
 
 extern struct PlannedStmt *planner(Query *parse, const char *query_string,
 								   int cursorOptions,
@@ -153,7 +150,8 @@ extern Node *estimate_expression_value(PlannerInfo *root, Node *node);
 extern Expr *evaluate_expr(Expr *expr, Oid result_type, int32 result_typmod,
 						   Oid result_collation);
 
-extern List *expand_function_arguments(List *args, Oid result_type,
+extern List *expand_function_arguments(List *args, bool include_out_arguments,
+									   Oid result_type,
 									   struct HeapTupleData *func_tuple);
 
 /* in util/predtest.c: */
@@ -199,6 +197,6 @@ extern bool contain_var_clause(Node *node);
 extern bool contain_vars_of_level(Node *node, int levelsup);
 extern int	locate_var_of_level(Node *node, int levelsup);
 extern List *pull_var_clause(Node *node, int flags);
-extern Node *flatten_join_alias_vars(Query *query, Node *node);
+extern Node *flatten_join_alias_vars(PlannerInfo *root, Query *query, Node *node);
 
 #endif							/* OPTIMIZER_H */

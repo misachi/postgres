@@ -4,7 +4,7 @@
  *	  definitions for run-time statistics collection
  *
  *
- * Copyright (c) 2001-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2023, PostgreSQL Global Development Group
  *
  * src/include/executor/instrument.h
  *
@@ -16,6 +16,11 @@
 #include "portability/instr_time.h"
 
 
+/*
+ * BufferUsage and WalUsage counters keep being incremented infinitely,
+ * i.e., must never be reset to zero, so that we can calculate how much
+ * the counters are incremented in an arbitrary period.
+ */
 typedef struct BufferUsage
 {
 	int64		shared_blks_hit;	/* # of shared buffer hits */
@@ -28,10 +33,19 @@ typedef struct BufferUsage
 	int64		local_blks_written; /* # of local disk blocks written */
 	int64		temp_blks_read; /* # of temp blocks read */
 	int64		temp_blks_written;	/* # of temp blocks written */
-	instr_time	blk_read_time;	/* time spent reading */
-	instr_time	blk_write_time; /* time spent writing */
+	instr_time	blk_read_time;	/* time spent reading blocks */
+	instr_time	blk_write_time; /* time spent writing blocks */
+	instr_time	temp_blk_read_time; /* time spent reading temp blocks */
+	instr_time	temp_blk_write_time;	/* time spent writing temp blocks */
 } BufferUsage;
 
+/*
+ * WalUsage tracks only WAL activity like WAL records generation that
+ * can be measured per query and is displayed by EXPLAIN command,
+ * pg_stat_statements extension, etc. It does not track other WAL activity
+ * like WAL writes that it's not worth measuring per query. That's tracked
+ * by WAL global statistics counters in WalStats, instead.
+ */
 typedef struct WalUsage
 {
 	int64		wal_records;	/* # of WAL records produced */

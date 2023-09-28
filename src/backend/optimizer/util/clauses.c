@@ -3,7 +3,7 @@
  * clauses.c
  *	  routines to manipulate qualification clauses
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -31,6 +31,7 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "nodes/multibitmapset.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/subscripting.h"
 #include "nodes/supportnodes.h"
@@ -43,12 +44,15 @@
 #include "parser/parse_agg.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_func.h"
+#include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
+#include "utils/json.h"
+#include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
@@ -124,10 +128,13 @@ static Expr *simplify_function(Oid funcid,
 							   Oid result_collid, Oid input_collid, List **args_p,
 							   bool funcvariadic, bool process_args, bool allow_non_const,
 							   eval_const_expressions_context *context);
-static List *reorder_function_arguments(List *args, HeapTuple func_tuple);
-static List *add_function_defaults(List *args, HeapTuple func_tuple);
+static List *reorder_function_arguments(List *args, int pronargs,
+										HeapTuple func_tuple);
+static List *add_function_defaults(List *args, int pronargs,
+								   HeapTuple func_tuple);
 static List *fetch_function_defaults(HeapTuple func_tuple);
 static void recheck_cast_function_args(List *args, Oid result_type,
+									   Oid *proargtypes, int pronargs,
 									   HeapTuple func_tuple);
 static Expr *evaluate_function(Oid funcid, Oid result_type, int32 result_typmod,
 							   Oid result_collid, Oid input_collid, List *args,
@@ -148,6 +155,7 @@ static Query *substitute_actual_srf_parameters(Query *expr,
 											   int nargs, List *args);
 static Node *substitute_actual_srf_parameters_mutator(Node *node,
 													  substitute_actual_srf_parameters_context *context);
+static bool pull_paramids_walker(Node *node, Bitmapset **context);
 
 
 /*****************************************************************************
@@ -376,6 +384,33 @@ contain_mutable_functions_walker(Node *node, void *context)
 	if (check_functions_in_node(node, contain_mutable_functions_checker,
 								context))
 		return true;
+
+	if (IsA(node, JsonConstructorExpr))
+	{
+		const JsonConstructorExpr *ctor = (JsonConstructorExpr *) node;
+		ListCell   *lc;
+		bool		is_jsonb;
+
+		is_jsonb = ctor->returning->format->format_type == JS_FORMAT_JSONB;
+
+		/*
+		 * Check argument_type => json[b] conversions specifically.  We still
+		 * recurse to check 'args' below, but here we want to specifically
+		 * check whether or not the emitted clause would fail to be immutable
+		 * because of TimeZone, for example.
+		 */
+		foreach(lc, ctor->args)
+		{
+			Oid			typid = exprType(lfirst(lc));
+
+			if (is_jsonb ?
+				!to_jsonb_is_immutable(typid) :
+				!to_json_is_immutable(typid))
+				return true;
+		}
+
+		/* Check all subnodes */
+	}
 
 	if (IsA(node, SQLValueFunction))
 	{
@@ -1506,6 +1541,31 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
 			 expr->booltesttype == IS_NOT_UNKNOWN))
 			result = find_nonnullable_rels_walker((Node *) expr->arg, false);
 	}
+	else if (IsA(node, SubPlan))
+	{
+		SubPlan    *splan = (SubPlan *) node;
+
+		/*
+		 * For some types of SubPlan, we can infer strictness from Vars in the
+		 * testexpr (the LHS of the original SubLink).
+		 *
+		 * For ANY_SUBLINK, if the subquery produces zero rows, the result is
+		 * always FALSE.  If the subquery produces more than one row, the
+		 * per-row results of the testexpr are combined using OR semantics.
+		 * Hence ANY_SUBLINK can be strict only at top level, but there it's
+		 * as strict as the testexpr is.
+		 *
+		 * For ROWCOMPARE_SUBLINK, if the subquery produces zero rows, the
+		 * result is always NULL.  Otherwise, the result is as strict as the
+		 * testexpr is.  So we can check regardless of top_level.
+		 *
+		 * We can't prove anything for other sublink types (in particular,
+		 * note that ALL_SUBLINK will return TRUE if the subquery is empty).
+		 */
+		if ((top_level && splan->subLinkType == ANY_SUBLINK) ||
+			splan->subLinkType == ROWCOMPARE_SUBLINK)
+			result = find_nonnullable_rels_walker(splan->testexpr, top_level);
+	}
 	else if (IsA(node, PlaceHolderVar))
 	{
 		PlaceHolderVar *phv = (PlaceHolderVar *) node;
@@ -1536,7 +1596,7 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
  * find_nonnullable_vars
  *		Determine which Vars are forced nonnullable by given clause.
  *
- * Returns a list of all level-zero Vars that are referenced in the clause in
+ * Returns the set of all level-zero Vars that are referenced in the clause in
  * such a way that the clause cannot possibly return TRUE if any of these Vars
  * is NULL.  (It is OK to err on the side of conservatism; hence the analysis
  * here is simplistic.)
@@ -1548,8 +1608,9 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
  * the expression to have been AND/OR flattened and converted to implicit-AND
  * format.
  *
- * The result is a palloc'd List, but we have not copied the member Var nodes.
- * Also, we don't bother trying to eliminate duplicate entries.
+ * Attnos of the identified Vars are returned in a multibitmapset (a List of
+ * Bitmapsets).  List indexes correspond to relids (varnos), while the per-rel
+ * Bitmapsets hold varattnos offset by FirstLowInvalidHeapAttributeNumber.
  *
  * top_level is true while scanning top-level AND/OR structure; here, showing
  * the result is either FALSE or NULL is good enough.  top_level is false when
@@ -1578,7 +1639,9 @@ find_nonnullable_vars_walker(Node *node, bool top_level)
 		Var		   *var = (Var *) node;
 
 		if (var->varlevelsup == 0)
-			result = list_make1(var);
+			result = mbms_add_member(result,
+									 var->varno,
+									 var->varattno - FirstLowInvalidHeapAttributeNumber);
 	}
 	else if (IsA(node, List))
 	{
@@ -1593,9 +1656,9 @@ find_nonnullable_vars_walker(Node *node, bool top_level)
 		 */
 		foreach(l, (List *) node)
 		{
-			result = list_concat(result,
-								 find_nonnullable_vars_walker(lfirst(l),
-															  top_level));
+			result = mbms_add_members(result,
+									  find_nonnullable_vars_walker(lfirst(l),
+																   top_level));
 		}
 	}
 	else if (IsA(node, FuncExpr))
@@ -1627,7 +1690,12 @@ find_nonnullable_vars_walker(Node *node, bool top_level)
 		switch (expr->boolop)
 		{
 			case AND_EXPR:
-				/* At top level we can just recurse (to the List case) */
+
+				/*
+				 * At top level we can just recurse (to the List case), since
+				 * the result should be the union of what we can prove in each
+				 * arm.
+				 */
 				if (top_level)
 				{
 					result = find_nonnullable_vars_walker((Node *) expr->args,
@@ -1659,7 +1727,7 @@ find_nonnullable_vars_walker(Node *node, bool top_level)
 					if (result == NIL)	/* first subresult? */
 						result = subresult;
 					else
-						result = list_intersection(result, subresult);
+						result = mbms_int_members(result, subresult);
 
 					/*
 					 * If the intersection is empty, we can stop looking. This
@@ -1731,6 +1799,15 @@ find_nonnullable_vars_walker(Node *node, bool top_level)
 			 expr->booltesttype == IS_NOT_UNKNOWN))
 			result = find_nonnullable_vars_walker((Node *) expr->arg, false);
 	}
+	else if (IsA(node, SubPlan))
+	{
+		SubPlan    *splan = (SubPlan *) node;
+
+		/* See analysis in find_nonnullable_rels_walker */
+		if ((top_level && splan->subLinkType == ANY_SUBLINK) ||
+			splan->subLinkType == ROWCOMPARE_SUBLINK)
+			result = find_nonnullable_vars_walker(splan->testexpr, top_level);
+	}
 	else if (IsA(node, PlaceHolderVar))
 	{
 		PlaceHolderVar *phv = (PlaceHolderVar *) node;
@@ -1749,8 +1826,8 @@ find_nonnullable_vars_walker(Node *node, bool top_level)
  * side of conservatism; hence the analysis here is simplistic.  In fact,
  * we only detect simple "var IS NULL" tests at the top level.)
  *
- * The result is a palloc'd List, but we have not copied the member Var nodes.
- * Also, we don't bother trying to eliminate duplicate entries.
+ * As with find_nonnullable_vars, we return the varattnos of the identified
+ * Vars in a multibitmapset.
  */
 List *
 find_forced_null_vars(Node *node)
@@ -1765,7 +1842,9 @@ find_forced_null_vars(Node *node)
 	var = find_forced_null_var(node);
 	if (var)
 	{
-		result = list_make1(var);
+		result = mbms_add_member(result,
+								 var->varno,
+								 var->varattno - FirstLowInvalidHeapAttributeNumber);
 	}
 	/* Otherwise, handle AND-conditions */
 	else if (IsA(node, List))
@@ -1776,8 +1855,8 @@ find_forced_null_vars(Node *node)
 		 */
 		foreach(l, (List *) node)
 		{
-			result = list_concat(result,
-								 find_forced_null_vars(lfirst(l)));
+			result = mbms_add_members(result,
+									  find_forced_null_vars((Node *) lfirst(l)));
 		}
 	}
 	else if (IsA(node, BoolExpr))
@@ -1962,14 +2041,16 @@ is_pseudo_constant_clause_relids(Node *clause, Relids relids)
  * NumRelids
  *		(formerly clause_relids)
  *
- * Returns the number of different relations referenced in 'clause'.
+ * Returns the number of different base relations referenced in 'clause'.
  */
 int
 NumRelids(PlannerInfo *root, Node *clause)
 {
+	int			result;
 	Relids		varnos = pull_varnos(root, clause);
-	int			result = bms_num_members(varnos);
 
+	varnos = bms_del_members(varnos, root->outer_join_rels);
+	result = bms_num_members(varnos);
 	bms_free(varnos);
 	return result;
 }
@@ -2112,7 +2193,8 @@ eval_const_expressions(PlannerInfo *root, Node *node)
  *
  * We'll use a hash table if all of the following conditions are met:
  * 1. The 2nd argument of the array contain only Consts.
- * 2. useOr is true.
+ * 2. useOr is true or there is a valid negator operator for the
+ *	  ScalarArrayOpExpr's opno.
  * 3. There's valid hash function for both left and righthand operands and
  *	  these hash functions are the same.
  * 4. If the array contains enough elements for us to consider it to be
@@ -2137,27 +2219,71 @@ convert_saop_to_hashed_saop_walker(Node *node, void *context)
 		Oid			lefthashfunc;
 		Oid			righthashfunc;
 
-		if (saop->useOr && arrayarg && IsA(arrayarg, Const) &&
-			!((Const *) arrayarg)->constisnull &&
-			get_op_hash_functions(saop->opno, &lefthashfunc, &righthashfunc) &&
-			lefthashfunc == righthashfunc)
+		if (arrayarg && IsA(arrayarg, Const) &&
+			!((Const *) arrayarg)->constisnull)
 		{
-			Datum		arrdatum = ((Const *) arrayarg)->constvalue;
-			ArrayType  *arr = (ArrayType *) DatumGetPointer(arrdatum);
-			int			nitems;
-
-			/*
-			 * Only fill in the hash functions if the array looks large enough
-			 * for it to be worth hashing instead of doing a linear search.
-			 */
-			nitems = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
-
-			if (nitems >= MIN_ARRAY_SIZE_FOR_HASHED_SAOP)
+			if (saop->useOr)
 			{
-				/* Looks good. Fill in the hash functions */
-				saop->hashfuncid = lefthashfunc;
+				if (get_op_hash_functions(saop->opno, &lefthashfunc, &righthashfunc) &&
+					lefthashfunc == righthashfunc)
+				{
+					Datum		arrdatum = ((Const *) arrayarg)->constvalue;
+					ArrayType  *arr = (ArrayType *) DatumGetPointer(arrdatum);
+					int			nitems;
+
+					/*
+					 * Only fill in the hash functions if the array looks
+					 * large enough for it to be worth hashing instead of
+					 * doing a linear search.
+					 */
+					nitems = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
+
+					if (nitems >= MIN_ARRAY_SIZE_FOR_HASHED_SAOP)
+					{
+						/* Looks good. Fill in the hash functions */
+						saop->hashfuncid = lefthashfunc;
+					}
+					return true;
+				}
 			}
-			return true;
+			else				/* !saop->useOr */
+			{
+				Oid			negator = get_negator(saop->opno);
+
+				/*
+				 * Check if this is a NOT IN using an operator whose negator
+				 * is hashable.  If so we can still build a hash table and
+				 * just ensure the lookup items are not in the hash table.
+				 */
+				if (OidIsValid(negator) &&
+					get_op_hash_functions(negator, &lefthashfunc, &righthashfunc) &&
+					lefthashfunc == righthashfunc)
+				{
+					Datum		arrdatum = ((Const *) arrayarg)->constvalue;
+					ArrayType  *arr = (ArrayType *) DatumGetPointer(arrdatum);
+					int			nitems;
+
+					/*
+					 * Only fill in the hash functions if the array looks
+					 * large enough for it to be worth hashing instead of
+					 * doing a linear search.
+					 */
+					nitems = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
+
+					if (nitems >= MIN_ARRAY_SIZE_FOR_HASHED_SAOP)
+					{
+						/* Looks good. Fill in the hash functions */
+						saop->hashfuncid = lefthashfunc;
+
+						/*
+						 * Also set the negfuncid.  The executor will need
+						 * that to perform hashtable lookups.
+						 */
+						saop->negfuncid = get_opcode(negator);
+					}
+					return true;
+				}
+			}
 		}
 	}
 
@@ -2282,6 +2408,7 @@ eval_const_expressions_mutator(Node *node,
 							int16		typLen;
 							bool		typByVal;
 							Datum		pval;
+							Const	   *con;
 
 							get_typlenbyval(param->paramtype,
 											&typLen, &typByVal);
@@ -2289,13 +2416,15 @@ eval_const_expressions_mutator(Node *node,
 								pval = prm->value;
 							else
 								pval = datumCopy(prm->value, typByVal, typLen);
-							return (Node *) makeConst(param->paramtype,
-													  param->paramtypmod,
-													  param->paramcollid,
-													  (int) typLen,
-													  pval,
-													  prm->isnull,
-													  typByVal);
+							con = makeConst(param->paramtype,
+											param->paramtypmod,
+											param->paramcollid,
+											(int) typLen,
+											pval,
+											prm->isnull,
+											typByVal);
+							con->location = param->location;
+							return (Node *) con;
 						}
 					}
 				}
@@ -2326,7 +2455,8 @@ eval_const_expressions_mutator(Node *node,
 				if (!HeapTupleIsValid(func_tuple))
 					elog(ERROR, "cache lookup failed for function %u", funcid);
 
-				args = expand_function_arguments(expr->args, expr->wintype,
+				args = expand_function_arguments(expr->args,
+												 false, expr->wintype,
 												 func_tuple);
 
 				ReleaseSysCache(func_tuple);
@@ -2693,6 +2823,19 @@ eval_const_expressions_mutator(Node *node,
 				}
 				break;
 			}
+
+		case T_JsonValueExpr:
+			{
+				JsonValueExpr *jve = (JsonValueExpr *) node;
+				Node	   *formatted;
+
+				formatted = eval_const_expressions_mutator((Node *) jve->formatted_expr,
+														   context);
+				if (formatted && IsA(formatted, Const))
+					return formatted;
+				break;
+			}
+
 		case T_SubPlan:
 		case T_AlternativeSubPlan:
 
@@ -3841,7 +3984,7 @@ simplify_function(Oid funcid, Oid result_type, int32 result_typmod,
 	 */
 	if (process_args)
 	{
-		args = expand_function_arguments(args, result_type, func_tuple);
+		args = expand_function_arguments(args, false, result_type, func_tuple);
 		args = (List *) expression_tree_mutator((Node *) args,
 												eval_const_expressions_mutator,
 												(void *) context);
@@ -3905,6 +4048,15 @@ simplify_function(Oid funcid, Oid result_type, int32 result_typmod,
  * expand_function_arguments: convert named-notation args to positional args
  * and/or insert default args, as needed
  *
+ * Returns a possibly-transformed version of the args list.
+ *
+ * If include_out_arguments is true, then the args list and the result
+ * include OUT arguments.
+ *
+ * The expected result type of the call must be given, for sanity-checking
+ * purposes.  Also, we ask the caller to provide the function's actual
+ * pg_proc tuple, not just its OID.
+ *
  * If we need to change anything, the input argument list is copied, not
  * modified.
  *
@@ -3913,11 +4065,45 @@ simplify_function(Oid funcid, Oid result_type, int32 result_typmod,
  * will fall through very quickly if there's nothing to do.
  */
 List *
-expand_function_arguments(List *args, Oid result_type, HeapTuple func_tuple)
+expand_function_arguments(List *args, bool include_out_arguments,
+						  Oid result_type, HeapTuple func_tuple)
 {
 	Form_pg_proc funcform = (Form_pg_proc) GETSTRUCT(func_tuple);
+	Oid		   *proargtypes = funcform->proargtypes.values;
+	int			pronargs = funcform->pronargs;
 	bool		has_named_args = false;
 	ListCell   *lc;
+
+	/*
+	 * If we are asked to match to OUT arguments, then use the proallargtypes
+	 * array (which includes those); otherwise use proargtypes (which
+	 * doesn't).  Of course, if proallargtypes is null, we always use
+	 * proargtypes.  (Fetching proallargtypes is annoyingly expensive
+	 * considering that we may have nothing to do here, but fortunately the
+	 * common case is include_out_arguments == false.)
+	 */
+	if (include_out_arguments)
+	{
+		Datum		proallargtypes;
+		bool		isNull;
+
+		proallargtypes = SysCacheGetAttr(PROCOID, func_tuple,
+										 Anum_pg_proc_proallargtypes,
+										 &isNull);
+		if (!isNull)
+		{
+			ArrayType  *arr = DatumGetArrayTypeP(proallargtypes);
+
+			pronargs = ARR_DIMS(arr)[0];
+			if (ARR_NDIM(arr) != 1 ||
+				pronargs < 0 ||
+				ARR_HASNULL(arr) ||
+				ARR_ELEMTYPE(arr) != OIDOID)
+				elog(ERROR, "proallargtypes is not a 1-D Oid array or it contains nulls");
+			Assert(pronargs >= funcform->pronargs);
+			proargtypes = (Oid *) ARR_DATA_PTR(arr);
+		}
+	}
 
 	/* Do we have any named arguments? */
 	foreach(lc, args)
@@ -3934,16 +4120,20 @@ expand_function_arguments(List *args, Oid result_type, HeapTuple func_tuple)
 	/* If so, we must apply reorder_function_arguments */
 	if (has_named_args)
 	{
-		args = reorder_function_arguments(args, func_tuple);
+		args = reorder_function_arguments(args, pronargs, func_tuple);
 		/* Recheck argument types and add casts if needed */
-		recheck_cast_function_args(args, result_type, func_tuple);
+		recheck_cast_function_args(args, result_type,
+								   proargtypes, pronargs,
+								   func_tuple);
 	}
-	else if (list_length(args) < funcform->pronargs)
+	else if (list_length(args) < pronargs)
 	{
 		/* No named args, but we seem to be short some defaults */
-		args = add_function_defaults(args, func_tuple);
+		args = add_function_defaults(args, pronargs, func_tuple);
 		/* Recheck argument types and add casts if needed */
-		recheck_cast_function_args(args, result_type, func_tuple);
+		recheck_cast_function_args(args, result_type,
+								   proargtypes, pronargs,
+								   func_tuple);
 	}
 
 	return args;
@@ -3956,10 +4146,9 @@ expand_function_arguments(List *args, Oid result_type, HeapTuple func_tuple)
  * impossible to form a truly valid positional call without that.
  */
 static List *
-reorder_function_arguments(List *args, HeapTuple func_tuple)
+reorder_function_arguments(List *args, int pronargs, HeapTuple func_tuple)
 {
 	Form_pg_proc funcform = (Form_pg_proc) GETSTRUCT(func_tuple);
-	int			pronargs = funcform->pronargs;
 	int			nargsprovided = list_length(args);
 	Node	   *argarray[FUNC_MAX_ARGS];
 	ListCell   *lc;
@@ -3986,6 +4175,7 @@ reorder_function_arguments(List *args, HeapTuple func_tuple)
 		{
 			NamedArgExpr *na = (NamedArgExpr *) arg;
 
+			Assert(na->argnumber >= 0 && na->argnumber < pronargs);
 			Assert(argarray[na->argnumber] == NULL);
 			argarray[na->argnumber] = (Node *) na->arg;
 		}
@@ -4026,9 +4216,8 @@ reorder_function_arguments(List *args, HeapTuple func_tuple)
  * and so we know we just need to add defaults at the end.
  */
 static List *
-add_function_defaults(List *args, HeapTuple func_tuple)
+add_function_defaults(List *args, int pronargs, HeapTuple func_tuple)
 {
-	Form_pg_proc funcform = (Form_pg_proc) GETSTRUCT(func_tuple);
 	int			nargsprovided = list_length(args);
 	List	   *defaults;
 	int			ndelete;
@@ -4037,11 +4226,11 @@ add_function_defaults(List *args, HeapTuple func_tuple)
 	defaults = fetch_function_defaults(func_tuple);
 
 	/* Delete any unused defaults from the list */
-	ndelete = nargsprovided + list_length(defaults) - funcform->pronargs;
+	ndelete = nargsprovided + list_length(defaults) - pronargs;
 	if (ndelete < 0)
 		elog(ERROR, "not enough default arguments");
 	if (ndelete > 0)
-		defaults = list_copy_tail(defaults, ndelete);
+		defaults = list_delete_first_n(defaults, ndelete);
 
 	/* And form the combined argument list, not modifying the input list */
 	return list_concat_copy(args, defaults);
@@ -4055,15 +4244,10 @@ fetch_function_defaults(HeapTuple func_tuple)
 {
 	List	   *defaults;
 	Datum		proargdefaults;
-	bool		isnull;
 	char	   *str;
 
-	/* The error cases here shouldn't happen, but check anyway */
-	proargdefaults = SysCacheGetAttr(PROCOID, func_tuple,
-									 Anum_pg_proc_proargdefaults,
-									 &isnull);
-	if (isnull)
-		elog(ERROR, "not enough default arguments");
+	proargdefaults = SysCacheGetAttrNotNull(PROCOID, func_tuple,
+											Anum_pg_proc_proargdefaults);
 	str = TextDatumGetCString(proargdefaults);
 	defaults = castNode(List, stringToNode(str));
 	pfree(str);
@@ -4086,7 +4270,9 @@ fetch_function_defaults(HeapTuple func_tuple)
  * caller should have already copied the list structure.
  */
 static void
-recheck_cast_function_args(List *args, Oid result_type, HeapTuple func_tuple)
+recheck_cast_function_args(List *args, Oid result_type,
+						   Oid *proargtypes, int pronargs,
+						   HeapTuple func_tuple)
 {
 	Form_pg_proc funcform = (Form_pg_proc) GETSTRUCT(func_tuple);
 	int			nargs;
@@ -4102,9 +4288,8 @@ recheck_cast_function_args(List *args, Oid result_type, HeapTuple func_tuple)
 	{
 		actual_arg_types[nargs++] = exprType((Node *) lfirst(lc));
 	}
-	Assert(nargs == funcform->pronargs);
-	memcpy(declared_arg_types, funcform->proargtypes.values,
-		   funcform->pronargs * sizeof(Oid));
+	Assert(nargs == pronargs);
+	memcpy(declared_arg_types, proargtypes, pronargs * sizeof(Oid));
 	rettype = enforce_generic_type_consistency(actual_arg_types,
 											   declared_arg_types,
 											   nargs,
@@ -4301,7 +4486,7 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 		return NULL;
 
 	/* Check permission to call function (fail later, if not) */
-	if (pg_proc_aclcheck(funcid, GetUserId(), ACL_EXECUTE) != ACLCHECK_OK)
+	if (object_aclcheck(ProcedureRelationId, funcid, GetUserId(), ACL_EXECUTE) != ACLCHECK_OK)
 		return NULL;
 
 	/* Check whether a plugin wants to hook function entry/exit */
@@ -4317,13 +4502,24 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 								  ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(mycxt);
 
+	/*
+	 * We need a dummy FuncExpr node containing the already-simplified
+	 * arguments.  (In some cases we don't really need it, but building it is
+	 * cheap enough that it's not worth contortions to avoid.)
+	 */
+	fexpr = makeNode(FuncExpr);
+	fexpr->funcid = funcid;
+	fexpr->funcresulttype = result_type;
+	fexpr->funcretset = false;
+	fexpr->funcvariadic = funcvariadic;
+	fexpr->funcformat = COERCE_EXPLICIT_CALL;	/* doesn't matter */
+	fexpr->funccollid = result_collid;	/* doesn't matter */
+	fexpr->inputcollid = input_collid;
+	fexpr->args = args;
+	fexpr->location = -1;
+
 	/* Fetch the function body */
-	tmp = SysCacheGetAttr(PROCOID,
-						  func_tuple,
-						  Anum_pg_proc_prosrc,
-						  &isNull);
-	if (isNull)
-		elog(ERROR, "null prosrc for function %u", funcid);
+	tmp = SysCacheGetAttrNotNull(PROCOID, func_tuple, Anum_pg_proc_prosrc);
 	src = TextDatumGetCString(tmp);
 
 	/*
@@ -4346,44 +4542,29 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 	if (!isNull)
 	{
 		Node	   *n;
-		List	   *querytree_list;
+		List	   *query_list;
 
 		n = stringToNode(TextDatumGetCString(tmp));
 		if (IsA(n, List))
-			querytree_list = linitial_node(List, castNode(List, n));
+			query_list = linitial_node(List, castNode(List, n));
 		else
-			querytree_list = list_make1(n);
-		if (list_length(querytree_list) != 1)
+			query_list = list_make1(n);
+		if (list_length(query_list) != 1)
 			goto fail;
-		querytree = linitial(querytree_list);
+		querytree = linitial(query_list);
+
+		/*
+		 * Because we'll insist below that the querytree have an empty rtable
+		 * and no sublinks, it cannot have any relation references that need
+		 * to be locked or rewritten.  So we can omit those steps.
+		 */
 	}
 	else
 	{
-		/*
-		 * Set up to handle parameters while parsing the function body.  We
-		 * need a dummy FuncExpr node containing the already-simplified
-		 * arguments to pass to prepare_sql_fn_parse_info.  (In some cases we
-		 * don't really need that, but for simplicity we always build it.)
-		 */
-		fexpr = makeNode(FuncExpr);
-		fexpr->funcid = funcid;
-		fexpr->funcresulttype = result_type;
-		fexpr->funcretset = false;
-		fexpr->funcvariadic = funcvariadic;
-		fexpr->funcformat = COERCE_EXPLICIT_CALL;	/* doesn't matter */
-		fexpr->funccollid = result_collid;	/* doesn't matter */
-		fexpr->inputcollid = input_collid;
-		fexpr->args = args;
-		fexpr->location = -1;
-
+		/* Set up to handle parameters while parsing the function body. */
 		pinfo = prepare_sql_fn_parse_info(func_tuple,
 										  (Node *) fexpr,
 										  input_collid);
-
-		/* fexpr also provides a convenient way to resolve a composite result */
-		(void) get_expr_result_type((Node *) fexpr,
-									NULL,
-									&rettupdesc);
 
 		/*
 		 * We just do parsing and parse analysis, not rewriting, because
@@ -4433,6 +4614,11 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 		querytree->setOperations ||
 		list_length(querytree->targetList) != 1)
 		goto fail;
+
+	/* If the function result is composite, resolve it */
+	(void) get_expr_result_type((Node *) fexpr,
+								NULL,
+								&rettupdesc);
 
 	/*
 	 * Make sure the function (still) returns what it's declared to.  This
@@ -4837,7 +5023,7 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 		return NULL;
 
 	/* Check permission to call function (fail later, if not) */
-	if (pg_proc_aclcheck(func_oid, GetUserId(), ACL_EXECUTE) != ACLCHECK_OK)
+	if (object_aclcheck(ProcedureRelationId, func_oid, GetUserId(), ACL_EXECUTE) != ACLCHECK_OK)
 		return NULL;
 
 	/* Check whether a plugin wants to hook function entry/exit */
@@ -4886,12 +5072,7 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 	oldcxt = MemoryContextSwitchTo(mycxt);
 
 	/* Fetch the function body */
-	tmp = SysCacheGetAttr(PROCOID,
-						  func_tuple,
-						  Anum_pg_proc_prosrc,
-						  &isNull);
-	if (isNull)
-		elog(ERROR, "null prosrc for function %u", func_oid);
+	tmp = SysCacheGetAttrNotNull(PROCOID, func_tuple, Anum_pg_proc_prosrc);
 	src = TextDatumGetCString(tmp);
 
 	/*
@@ -4924,6 +5105,8 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 			goto fail;
 		querytree = linitial(querytree_list);
 
+		/* Acquire necessary locks, then apply rewriter. */
+		AcquireRewriteLocks(querytree, true, false);
 		querytree_list = pg_rewrite_query(querytree);
 		if (list_length(querytree_list) != 1)
 			goto fail;
@@ -4949,7 +5132,7 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 		if (list_length(raw_parsetree_list) != 1)
 			goto fail;
 
-		querytree_list = pg_analyze_and_rewrite_params(linitial(raw_parsetree_list),
+		querytree_list = pg_analyze_and_rewrite_withcb(linitial(raw_parsetree_list),
 													   src,
 													   (ParserSetupHook) sql_fn_parser_setup,
 													   pinfo, NULL);
@@ -5034,6 +5217,13 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 	 */
 	record_plan_function_dependency(root, func_oid);
 
+	/*
+	 * We must also notice if the inserted query adds a dependency on the
+	 * calling role due to RLS quals.
+	 */
+	if (querytree->hasRowSecurity)
+		root->glob->dependsOnRole = true;
+
 	return querytree;
 
 	/* Here if func is not inlinable: release temp memory and return NULL */
@@ -5106,4 +5296,34 @@ substitute_actual_srf_parameters_mutator(Node *node,
 	return expression_tree_mutator(node,
 								   substitute_actual_srf_parameters_mutator,
 								   (void *) context);
+}
+
+/*
+ * pull_paramids
+ *		Returns a Bitmapset containing the paramids of all Params in 'expr'.
+ */
+Bitmapset *
+pull_paramids(Expr *expr)
+{
+	Bitmapset  *result = NULL;
+
+	(void) pull_paramids_walker((Node *) expr, &result);
+
+	return result;
+}
+
+static bool
+pull_paramids_walker(Node *node, Bitmapset **context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Param))
+	{
+		Param	   *param = (Param *) node;
+
+		*context = bms_add_member(*context, param->paramid);
+		return false;
+	}
+	return expression_tree_walker(node, pull_paramids_walker,
+								  (void *) context);
 }

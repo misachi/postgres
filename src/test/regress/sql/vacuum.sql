@@ -127,13 +127,15 @@ VACUUM no_index_cleanup;
 -- Both parent relation and toast are cleaned up.
 ALTER TABLE no_index_cleanup SET (vacuum_index_cleanup = true);
 VACUUM no_index_cleanup;
+ALTER TABLE no_index_cleanup SET (vacuum_index_cleanup = auto);
+VACUUM no_index_cleanup;
 -- Parameter is set for both the parent table and its toast relation.
 INSERT INTO no_index_cleanup(i, t) VALUES (generate_series(31,60),
     repeat('1234567890',269));
 DELETE FROM no_index_cleanup WHERE i < 45;
 -- Only toast index is cleaned up.
-ALTER TABLE no_index_cleanup SET (vacuum_index_cleanup = false,
-    toast.vacuum_index_cleanup = true);
+ALTER TABLE no_index_cleanup SET (vacuum_index_cleanup = off,
+    toast.vacuum_index_cleanup = yes);
 VACUUM no_index_cleanup;
 -- Only parent is cleaned up.
 ALTER TABLE no_index_cleanup SET (vacuum_index_cleanup = true,
@@ -141,16 +143,16 @@ ALTER TABLE no_index_cleanup SET (vacuum_index_cleanup = true,
 VACUUM no_index_cleanup;
 -- Test some extra relations.
 VACUUM (INDEX_CLEANUP FALSE) vaccluster;
-VACUUM (INDEX_CLEANUP FALSE) vactst; -- index cleanup option is ignored if no indexes
+VACUUM (INDEX_CLEANUP AUTO) vactst; -- index cleanup option is ignored if no indexes
 VACUUM (INDEX_CLEANUP FALSE, FREEZE TRUE) vaccluster;
 
 -- TRUNCATE option
-CREATE TABLE vac_truncate_test(i INT NOT NULL, j text)
+CREATE TEMP TABLE vac_truncate_test(i INT NOT NULL, j text)
 	WITH (vacuum_truncate=true, autovacuum_enabled=false);
 INSERT INTO vac_truncate_test VALUES (1, NULL), (NULL, NULL);
-VACUUM (TRUNCATE FALSE) vac_truncate_test;
+VACUUM (TRUNCATE FALSE, DISABLE_PAGE_SKIPPING) vac_truncate_test;
 SELECT pg_relation_size('vac_truncate_test') > 0;
-VACUUM vac_truncate_test;
+VACUUM (DISABLE_PAGE_SKIPPING) vac_truncate_test;
 SELECT pg_relation_size('vac_truncate_test') = 0;
 VACUUM (TRUNCATE FALSE, FULL TRUE) vac_truncate_test;
 DROP TABLE vac_truncate_test;
@@ -167,6 +169,22 @@ VACUUM (FREEZE) vacparted;
 -- check behavior with duplicate column mentions
 VACUUM ANALYZE vacparted(a,b,a);
 ANALYZE vacparted(a,b,b);
+
+-- partitioned table with index
+CREATE TABLE vacparted_i (a int primary key, b varchar(100))
+  PARTITION BY HASH (a);
+CREATE TABLE vacparted_i1 PARTITION OF vacparted_i
+  FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+CREATE TABLE vacparted_i2 PARTITION OF vacparted_i
+  FOR VALUES WITH (MODULUS 2, REMAINDER 1);
+INSERT INTO vacparted_i SELECT i, 'test_'|| i from generate_series(1,10) i;
+VACUUM (ANALYZE) vacparted_i;
+VACUUM (FULL) vacparted_i;
+VACUUM (FREEZE) vacparted_i;
+SELECT relname, relhasindex FROM pg_class
+  WHERE relname LIKE 'vacparted_i%' AND relkind IN ('p','r')
+  ORDER BY relname;
+DROP TABLE vacparted_i;
 
 -- multiple tables specified
 VACUUM vaccluster, vactst;
@@ -214,11 +232,70 @@ ANALYZE vactst;
 COMMIT;
 
 -- PROCESS_TOAST option
-ALTER TABLE vactst ADD COLUMN t TEXT;
-ALTER TABLE vactst ALTER COLUMN t SET STORAGE EXTERNAL;
-VACUUM (PROCESS_TOAST FALSE) vactst;
-VACUUM (PROCESS_TOAST FALSE, FULL) vactst;
+CREATE TABLE vac_option_tab (a INT, t TEXT);
+INSERT INTO vac_option_tab SELECT a, 't' || a FROM generate_series(1, 10) AS a;
+ALTER TABLE vac_option_tab ALTER COLUMN t SET STORAGE EXTERNAL;
+-- Check the number of vacuums done on table vac_option_tab and on its
+-- toast relation, to check that PROCESS_TOAST and PROCESS_MAIN work on
+-- what they should.
+CREATE VIEW vac_option_tab_counts AS
+  SELECT CASE WHEN c.relname IS NULL
+    THEN 'main' ELSE 'toast' END as rel,
+  s.vacuum_count
+  FROM pg_stat_all_tables s
+  LEFT JOIN pg_class c ON s.relid = c.reltoastrelid
+  WHERE c.relname = 'vac_option_tab' OR s.relname = 'vac_option_tab'
+  ORDER BY rel;
+VACUUM (PROCESS_TOAST TRUE) vac_option_tab;
+SELECT * FROM vac_option_tab_counts;
+VACUUM (PROCESS_TOAST FALSE) vac_option_tab;
+SELECT * FROM vac_option_tab_counts;
+VACUUM (PROCESS_TOAST FALSE, FULL) vac_option_tab; -- error
 
+-- PROCESS_MAIN option
+-- Only the toast table is processed.
+VACUUM (PROCESS_MAIN FALSE) vac_option_tab;
+SELECT * FROM vac_option_tab_counts;
+-- Nothing is processed.
+VACUUM (PROCESS_MAIN FALSE, PROCESS_TOAST FALSE) vac_option_tab;
+SELECT * FROM vac_option_tab_counts;
+-- Check if the filenodes nodes have been updated as wanted after FULL.
+SELECT relfilenode AS main_filenode FROM pg_class
+  WHERE relname = 'vac_option_tab' \gset
+SELECT t.relfilenode AS toast_filenode FROM pg_class c, pg_class t
+  WHERE c.reltoastrelid = t.oid AND c.relname = 'vac_option_tab' \gset
+-- Only the toast relation is processed.
+VACUUM (PROCESS_MAIN FALSE, FULL) vac_option_tab;
+SELECT relfilenode = :main_filenode AS is_same_main_filenode
+  FROM pg_class WHERE relname = 'vac_option_tab';
+SELECT t.relfilenode = :toast_filenode AS is_same_toast_filenode
+  FROM pg_class c, pg_class t
+  WHERE c.reltoastrelid = t.oid AND c.relname = 'vac_option_tab';
+
+-- BUFFER_USAGE_LIMIT option
+VACUUM (BUFFER_USAGE_LIMIT '512 kB') vac_option_tab;
+ANALYZE (BUFFER_USAGE_LIMIT '512 kB') vac_option_tab;
+-- try disabling the buffer usage limit
+VACUUM (BUFFER_USAGE_LIMIT 0) vac_option_tab;
+ANALYZE (BUFFER_USAGE_LIMIT 0) vac_option_tab;
+-- value exceeds max size error
+VACUUM (BUFFER_USAGE_LIMIT 16777220) vac_option_tab;
+-- value is less than min size error
+VACUUM (BUFFER_USAGE_LIMIT 120) vac_option_tab;
+-- integer overflow error
+VACUUM (BUFFER_USAGE_LIMIT 10000000000) vac_option_tab;
+-- incompatible with VACUUM FULL error
+VACUUM (BUFFER_USAGE_LIMIT '512 kB', FULL) vac_option_tab;
+
+-- SKIP_DATABASE_STATS option
+VACUUM (SKIP_DATABASE_STATS) vactst;
+
+-- ONLY_DATABASE_STATS option
+VACUUM (ONLY_DATABASE_STATS);
+VACUUM (ONLY_DATABASE_STATS) vactst;  -- error
+
+DROP VIEW vac_option_tab_counts;
+DROP TABLE vac_option_tab;
 DROP TABLE vaccluster;
 DROP TABLE vactst;
 DROP TABLE vacparted;

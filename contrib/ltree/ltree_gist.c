@@ -10,6 +10,7 @@
 #include "access/stratnum.h"
 #include "crc32.h"
 #include "ltree.h"
+#include "utils/array.h"
 
 #define NEXTVAL(x) ( (lquery*)( (char*)(x) + INTALIGN( VARSIZE(x) ) ) )
 #define ISEQ(a,b)	( (a)->numlevel == (b)->numlevel && ltree_compare(a,b)==0 )
@@ -22,8 +23,9 @@ ltree_gist_in(PG_FUNCTION_ARGS)
 {
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("ltree_gist_in() not implemented")));
-	PG_RETURN_DATUM(0);
+			 errmsg("cannot accept a value of type %s", "ltree_gist")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
 }
 
 Datum
@@ -31,8 +33,9 @@ ltree_gist_out(PG_FUNCTION_ARGS)
 {
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("ltree_gist_out() not implemented")));
-	PG_RETURN_DATUM(0);
+			 errmsg("cannot display a value of type %s", "ltree_gist")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
 }
 
 ltree_gist *
@@ -40,7 +43,7 @@ ltree_gist_alloc(bool isalltrue, BITVECP sign, int siglen,
 				 ltree *left, ltree *right)
 {
 	int32		size = LTG_HDRSIZE + (isalltrue ? 0 : siglen) +
-	(left ? VARSIZE(left) + (right ? VARSIZE(right) : 0) : 0);
+		(left ? VARSIZE(left) + (right ? VARSIZE(right) : 0) : 0);
 	ltree_gist *result = palloc(size);
 
 	SET_VARSIZE(result, size);
@@ -130,14 +133,14 @@ ltree_same(PG_FUNCTION_ARGS)
 	ltree_gist *a = (ltree_gist *) PG_GETARG_POINTER(0);
 	ltree_gist *b = (ltree_gist *) PG_GETARG_POINTER(1);
 	bool	   *result = (bool *) PG_GETARG_POINTER(2);
-	int			siglen = LTREE_GET_ASIGLEN();
+	int			siglen = LTREE_GET_SIGLEN();
 
 	*result = false;
 	if (LTG_ISONENODE(a) != LTG_ISONENODE(b))
 		PG_RETURN_POINTER(result);
 
 	if (LTG_ISONENODE(a))
-		*result = (ISEQ(LTG_NODE(a), LTG_NODE(b))) ? true : false;
+		*result = ISEQ(LTG_NODE(a), LTG_NODE(b));
 	else
 	{
 		int32		i;
@@ -190,7 +193,7 @@ ltree_union(PG_FUNCTION_ARGS)
 {
 	GistEntryVector *entryvec = (GistEntryVector *) PG_GETARG_POINTER(0);
 	int		   *size = (int *) PG_GETARG_POINTER(1);
-	int			siglen = LTREE_GET_ASIGLEN();
+	int			siglen = LTREE_GET_SIGLEN();
 	BITVECP		base = palloc0(siglen);
 	int32		i,
 				j;
@@ -260,7 +263,7 @@ ltree_penalty(PG_FUNCTION_ARGS)
 	ltree_gist *origval = (ltree_gist *) DatumGetPointer(((GISTENTRY *) PG_GETARG_POINTER(0))->key);
 	ltree_gist *newval = (ltree_gist *) DatumGetPointer(((GISTENTRY *) PG_GETARG_POINTER(1))->key);
 	float	   *penalty = (float *) PG_GETARG_POINTER(2);
-	int			siglen = LTREE_GET_ASIGLEN();
+	int			siglen = LTREE_GET_SIGLEN();
 	int32		cmpr,
 				cmpl;
 
@@ -292,7 +295,7 @@ ltree_picksplit(PG_FUNCTION_ARGS)
 {
 	GistEntryVector *entryvec = (GistEntryVector *) PG_GETARG_POINTER(0);
 	GIST_SPLITVEC *v = (GIST_SPLITVEC *) PG_GETARG_POINTER(1);
-	int			siglen = LTREE_GET_ASIGLEN();
+	int			siglen = LTREE_GET_SIGLEN();
 	OffsetNumber j;
 	int32		i;
 	RIX		   *array;
@@ -325,7 +328,7 @@ ltree_picksplit(PG_FUNCTION_ARGS)
 		array[j].r = LTG_GETLNODE(lu, siglen);
 	}
 
-	qsort((void *) &array[FirstOffsetNumber], maxoff - FirstOffsetNumber + 1,
+	qsort(&array[FirstOffsetNumber], maxoff - FirstOffsetNumber + 1,
 		  sizeof(RIX), treekey_cmp);
 
 	lu_l = lu_r = ru_l = ru_r = NULL;
@@ -618,7 +621,7 @@ ltree_consistent(PG_FUNCTION_ARGS)
 
 	/* Oid		subtype = PG_GETARG_OID(3); */
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
-	int			siglen = LTREE_GET_ASIGLEN();
+	int			siglen = LTREE_GET_SIGLEN();
 	ltree_gist *key = (ltree_gist *) DatumGetPointer(entry->key);
 	void	   *query = NULL;
 	bool		res = false;
@@ -716,6 +719,18 @@ ltree_consistent(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(res);
 }
 
+static void
+ltree_gist_relopts_validator(void *parsed_options, relopt_value *vals,
+							 int nvals)
+{
+	LtreeGistOptions *options = (LtreeGistOptions *) parsed_options;
+
+	if (options->siglen != INTALIGN(options->siglen))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("siglen value must be a multiple of %d", ALIGNOF_INT)));
+}
+
 Datum
 ltree_gist_options(PG_FUNCTION_ARGS)
 {
@@ -724,8 +739,11 @@ ltree_gist_options(PG_FUNCTION_ARGS)
 	init_local_reloptions(relopts, sizeof(LtreeGistOptions));
 	add_local_int_reloption(relopts, "siglen",
 							"signature length in bytes",
-							SIGLEN_DEFAULT, 1, SIGLEN_MAX,
+							LTREE_SIGLEN_DEFAULT,
+							INTALIGN(1),
+							LTREE_SIGLEN_MAX,
 							offsetof(LtreeGistOptions, siglen));
+	register_reloptions_validator(relopts, ltree_gist_relopts_validator);
 
 	PG_RETURN_VOID();
 }

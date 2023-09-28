@@ -9,7 +9,7 @@
  * and implementing search-path-controlled searches.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -28,6 +28,7 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_conversion.h"
+#include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
@@ -51,10 +52,11 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
-#include "utils/guc.h"
+#include "utils/guc_hooks.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/varlena.h"
 
@@ -65,9 +67,7 @@
  * may be included:
  *
  * 1. If a TEMP table namespace has been initialized in this session, it
- * is implicitly searched first.  (The only time this doesn't happen is
- * when we are obeying an override search path spec that says not to use the
- * temp namespace, or the temp namespace is included in the explicit list.)
+ * is implicitly searched first.
  *
  * 2. The system catalog namespace is always searched.  If the system
  * namespace is present in the explicit path then it will be searched in
@@ -106,19 +106,14 @@
  * namespace (if it exists), preceded by the user's personal namespace
  * (if one exists).
  *
- * We support a stack of "override" search path settings for use within
- * specific sections of backend code.  namespace_search_path is ignored
- * whenever the override stack is nonempty.  activeSearchPath is always
- * the actually active path; it points either to the search list of the
- * topmost stack entry, or to baseSearchPath which is the list derived
- * from namespace_search_path.
+ * activeSearchPath is always the actually active path; it points to
+ * to baseSearchPath which is the list derived from namespace_search_path.
  *
  * If baseSearchPathValid is false, then baseSearchPath (and other
  * derived variables) need to be recomputed from namespace_search_path.
  * We mark it invalid upon an assignment to namespace_search_path or receipt
  * of a syscache invalidation event for pg_namespace.  The recomputation
- * is done during the next non-overridden lookup attempt.  Note that an
- * override spec is never subject to recomputation.
+ * is done during the next lookup attempt.
  *
  * Any namespaces mentioned in namespace_search_path that are not readable
  * by the current user ID are simply left out of baseSearchPath; so
@@ -159,17 +154,6 @@ static Oid	namespaceUser = InvalidOid;
 /* The above four values are valid only if baseSearchPathValid */
 static bool baseSearchPathValid = true;
 
-/* Override requests are remembered in a stack of OverrideStackEntry structs */
-
-typedef struct
-{
-	List	   *searchPath;		/* the desired search path */
-	Oid			creationNamespace;	/* the desired creation namespace */
-	int			nestLevel;		/* subtransaction nesting level */
-} OverrideStackEntry;
-
-static List *overrideStack = NIL;
-
 /*
  * myTempNamespace is InvalidOid until and unless a TEMP namespace is set up
  * in a particular backend session (this happens when a CREATE TEMP TABLE
@@ -206,6 +190,7 @@ static void RemoveTempRelations(Oid tempNamespaceId);
 static void RemoveTempRelationsCallback(int code, Datum arg);
 static void NamespaceCallback(Datum arg, int cacheid, uint32 hashvalue);
 static bool MatchNamedCall(HeapTuple proctup, int nargs, List *argnames,
+						   bool include_out_arguments, int pronargs,
 						   int **argnumbers);
 
 
@@ -584,7 +569,7 @@ RangeVarGetAndCheckCreationNamespace(RangeVar *relation,
 			break;
 
 		/* Check namespace permissions. */
-		aclresult = pg_namespace_aclcheck(nspid, GetUserId(), ACL_CREATE);
+		aclresult = object_aclcheck(NamespaceRelationId, nspid, GetUserId(), ACL_CREATE);
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_SCHEMA,
 						   get_namespace_name(nspid));
@@ -610,7 +595,7 @@ RangeVarGetAndCheckCreationNamespace(RangeVar *relation,
 		/* Lock relation, if required if and we have permission. */
 		if (lockmode != NoLock && OidIsValid(relid))
 		{
-			if (!pg_class_ownercheck(relid, GetUserId()))
+			if (!object_ownercheck(RelationRelationId, relid, GetUserId()))
 				aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(get_rel_relkind(relid)),
 							   relation->relname);
 			if (relid != oldrelid)
@@ -901,6 +886,12 @@ TypeIsVisible(Oid typid)
  * of additional args (which can be retrieved from the function's
  * proargdefaults entry).
  *
+ * If include_out_arguments is true, then OUT-mode arguments are considered to
+ * be included in the argument list.  Their types are included in the returned
+ * arrays, and argnumbers are indexes in proallargtypes not proargtypes.
+ * We also set nominalnargs to be the length of proallargtypes not proargtypes.
+ * Otherwise OUT-mode arguments are ignored.
+ *
  * It is not possible for nvargs and ndargs to both be nonzero in the same
  * list entry, since default insertion allows matches to functions with more
  * than nargs arguments while the variadic transformation requires the same
@@ -911,7 +902,8 @@ TypeIsVisible(Oid typid)
  * first any positional arguments, then the named arguments, then defaulted
  * arguments (if needed and allowed by expand_defaults).  The argnumbers[]
  * array can be used to map this back to the catalog information.
- * argnumbers[k] is set to the proargtypes index of the k'th call argument.
+ * argnumbers[k] is set to the proargtypes or proallargtypes index of the
+ * k'th call argument.
  *
  * We search a single namespace if the function name is qualified, else
  * all namespaces in the search path.  In the multiple-namespace case,
@@ -935,13 +927,13 @@ TypeIsVisible(Oid typid)
  * such an entry it should react as though the call were ambiguous.
  *
  * If missing_ok is true, an empty list (NULL) is returned if the name was
- * schema- qualified with a schema that does not exist.  Likewise if no
+ * schema-qualified with a schema that does not exist.  Likewise if no
  * candidate is found for other reasons.
  */
 FuncCandidateList
 FuncnameGetCandidates(List *names, int nargs, List *argnames,
 					  bool expand_variadic, bool expand_defaults,
-					  bool missing_ok)
+					  bool include_out_arguments, bool missing_ok)
 {
 	FuncCandidateList resultList = NULL;
 	bool		any_special = false;
@@ -978,6 +970,7 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 	{
 		HeapTuple	proctup = &catlist->members[i]->tuple;
 		Form_pg_proc procform = (Form_pg_proc) GETSTRUCT(proctup);
+		Oid		   *proargtypes = procform->proargtypes.values;
 		int			pronargs = procform->pronargs;
 		int			effective_nargs;
 		int			pathpos = 0;
@@ -1010,6 +1003,35 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 			}
 			if (nsp == NULL)
 				continue;		/* proc is not in search path */
+		}
+
+		/*
+		 * If we are asked to match to OUT arguments, then use the
+		 * proallargtypes array (which includes those); otherwise use
+		 * proargtypes (which doesn't).  Of course, if proallargtypes is null,
+		 * we always use proargtypes.
+		 */
+		if (include_out_arguments)
+		{
+			Datum		proallargtypes;
+			bool		isNull;
+
+			proallargtypes = SysCacheGetAttr(PROCNAMEARGSNSP, proctup,
+											 Anum_pg_proc_proallargtypes,
+											 &isNull);
+			if (!isNull)
+			{
+				ArrayType  *arr = DatumGetArrayTypeP(proallargtypes);
+
+				pronargs = ARR_DIMS(arr)[0];
+				if (ARR_NDIM(arr) != 1 ||
+					pronargs < 0 ||
+					ARR_HASNULL(arr) ||
+					ARR_ELEMTYPE(arr) != OIDOID)
+					elog(ERROR, "proallargtypes is not a 1-D Oid array or it contains nulls");
+				Assert(pronargs >= procform->pronargs);
+				proargtypes = (Oid *) ARR_DATA_PTR(arr);
+			}
 		}
 
 		if (argnames != NIL)
@@ -1047,6 +1069,7 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 
 			/* Check for argument name match, generate positional mapping */
 			if (!MatchNamedCall(proctup, nargs, argnames,
+								include_out_arguments, pronargs,
 								&argnumbers))
 				continue;
 
@@ -1105,31 +1128,26 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 				   effective_nargs * sizeof(Oid));
 		newResult->pathpos = pathpos;
 		newResult->oid = procform->oid;
+		newResult->nominalnargs = pronargs;
 		newResult->nargs = effective_nargs;
 		newResult->argnumbers = argnumbers;
 		if (argnumbers)
 		{
 			/* Re-order the argument types into call's logical order */
-			Oid		   *proargtypes = procform->proargtypes.values;
-			int			i;
-
-			for (i = 0; i < pronargs; i++)
-				newResult->args[i] = proargtypes[argnumbers[i]];
+			for (int j = 0; j < pronargs; j++)
+				newResult->args[j] = proargtypes[argnumbers[j]];
 		}
 		else
 		{
 			/* Simple positional case, just copy proargtypes as-is */
-			memcpy(newResult->args, procform->proargtypes.values,
-				   pronargs * sizeof(Oid));
+			memcpy(newResult->args, proargtypes, pronargs * sizeof(Oid));
 		}
 		if (variadic)
 		{
-			int			i;
-
 			newResult->nvargs = effective_nargs - pronargs + 1;
 			/* Expand variadic argument into N copies of element type */
-			for (i = pronargs - 1; i < effective_nargs; i++)
-				newResult->args[i] = va_elem_type;
+			for (int j = pronargs - 1; j < effective_nargs; j++)
+				newResult->args[j] = va_elem_type;
 		}
 		else
 			newResult->nvargs = 0;
@@ -1293,6 +1311,10 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
  * the function, in positions after the last positional argument, and there
  * are defaults for all unsupplied arguments.
  *
+ * If include_out_arguments is true, we are treating OUT arguments as
+ * included in the argument list.  pronargs is the number of arguments
+ * we're considering (the length of either proargtypes or proallargtypes).
+ *
  * The number of positional arguments is nargs - list_length(argnames).
  * Note caller has already done basic checks on argument count.
  *
@@ -1303,10 +1325,10 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
  */
 static bool
 MatchNamedCall(HeapTuple proctup, int nargs, List *argnames,
+			   bool include_out_arguments, int pronargs,
 			   int **argnumbers)
 {
 	Form_pg_proc procform = (Form_pg_proc) GETSTRUCT(proctup);
-	int			pronargs = procform->pronargs;
 	int			numposargs = nargs - list_length(argnames);
 	int			pronallargs;
 	Oid		   *p_argtypes;
@@ -1333,6 +1355,8 @@ MatchNamedCall(HeapTuple proctup, int nargs, List *argnames,
 									&p_argtypes, &p_argnames, &p_argmodes);
 	Assert(p_argnames != NULL);
 
+	Assert(include_out_arguments ? (pronargs == pronallargs) : (pronargs <= pronallargs));
+
 	/* initialize state for matching */
 	*argnumbers = (int *) palloc(pronargs * sizeof(int));
 	memset(arggiven, false, pronargs * sizeof(bool));
@@ -1355,8 +1379,9 @@ MatchNamedCall(HeapTuple proctup, int nargs, List *argnames,
 		found = false;
 		for (i = 0; i < pronallargs; i++)
 		{
-			/* consider only input parameters */
-			if (p_argmodes &&
+			/* consider only input params, except with include_out_arguments */
+			if (!include_out_arguments &&
+				p_argmodes &&
 				(p_argmodes[i] != FUNC_PARAM_IN &&
 				 p_argmodes[i] != FUNC_PARAM_INOUT &&
 				 p_argmodes[i] != FUNC_PARAM_VARIADIC))
@@ -1371,7 +1396,7 @@ MatchNamedCall(HeapTuple proctup, int nargs, List *argnames,
 				found = true;
 				break;
 			}
-			/* increase pp only for input parameters */
+			/* increase pp only for considered parameters */
 			pp++;
 		}
 		/* if name isn't in proargnames, fail */
@@ -1448,7 +1473,7 @@ FunctionIsVisible(Oid funcid)
 		visible = false;
 
 		clist = FuncnameGetCandidates(list_make1(makeString(proname)),
-									  nargs, NIL, false, false, false);
+									  nargs, NIL, false, false, false, false);
 
 		for (; clist; clist = clist->next)
 		{
@@ -1721,6 +1746,7 @@ OpernameGetCandidates(List *names, char oprkind, bool missing_schema_ok)
 
 		newResult->pathpos = pathpos;
 		newResult->oid = operform->oid;
+		newResult->nominalnargs = 2;
 		newResult->nargs = 2;
 		newResult->nvargs = 0;
 		newResult->ndargs = 0;
@@ -2805,7 +2831,7 @@ TSConfigIsVisible(Oid cfgid)
  * *nspname_p is set to NULL if there is no explicit schema name.
  */
 void
-DeconstructQualifiedName(List *names,
+DeconstructQualifiedName(const List *names,
 						 char **nspname_p,
 						 char **objname_p)
 {
@@ -2911,7 +2937,7 @@ LookupExplicitNamespace(const char *nspname, bool missing_ok)
 	if (missing_ok && !OidIsValid(namespaceId))
 		return InvalidOid;
 
-	aclresult = pg_namespace_aclcheck(namespaceId, GetUserId(), ACL_USAGE);
+	aclresult = object_aclcheck(NamespaceRelationId, namespaceId, GetUserId(), ACL_USAGE);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_SCHEMA,
 					   nspname);
@@ -2947,7 +2973,7 @@ LookupCreationNamespace(const char *nspname)
 
 	namespaceId = get_namespace_oid(nspname, false);
 
-	aclresult = pg_namespace_aclcheck(namespaceId, GetUserId(), ACL_CREATE);
+	aclresult = object_aclcheck(NamespaceRelationId, namespaceId, GetUserId(), ACL_CREATE);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_SCHEMA,
 					   nspname);
@@ -2980,7 +3006,7 @@ CheckSetNamespace(Oid oldNspOid, Oid nspOid)
 
 /*
  * QualifiedNameGetCreationNamespace
- *		Given a possibly-qualified name for an object (in List-of-Values
+ *		Given a possibly-qualified name for an object (in List-of-Strings
  *		format), determine what namespace the object should be created in.
  *		Also extract and return the object name (last component of list).
  *
@@ -2991,7 +3017,7 @@ CheckSetNamespace(Oid oldNspOid, Oid nspOid)
  * if we have to create or clean out the temp namespace.
  */
 Oid
-QualifiedNameGetCreationNamespace(List *names, char **objname_p)
+QualifiedNameGetCreationNamespace(const List *names, char **objname_p)
 {
 	char	   *schemaname;
 	Oid			namespaceId;
@@ -3058,7 +3084,7 @@ get_namespace_oid(const char *nspname, bool missing_ok)
  *		Utility routine to convert a qualified-name list into RangeVar form.
  */
 RangeVar *
-makeRangeVarFromNameList(List *names)
+makeRangeVarFromNameList(const List *names)
 {
 	RangeVar   *rel = makeRangeVar(NULL, NULL, -1);
 
@@ -3094,11 +3120,11 @@ makeRangeVarFromNameList(List *names)
  * This is used primarily to form error messages, and so we do not quote
  * the list elements, for the sake of legibility.
  *
- * In most scenarios the list elements should always be Value strings,
+ * In most scenarios the list elements should always be String values,
  * but we also allow A_Star for the convenience of ColumnRef processing.
  */
 char *
-NameListToString(List *names)
+NameListToString(const List *names)
 {
 	StringInfoData string;
 	ListCell   *l;
@@ -3132,7 +3158,7 @@ NameListToString(List *names)
  * so the string could be re-parsed (eg, by textToQualifiedNameList).
  */
 char *
-NameListToQuotedString(List *names)
+NameListToQuotedString(const List *names)
 {
 	StringInfoData string;
 	ListCell   *l;
@@ -3348,17 +3374,16 @@ SetTempNamespaceState(Oid tempNamespaceId, Oid tempToastNamespaceId)
 
 
 /*
- * GetOverrideSearchPath - fetch current search path definition in form
- * used by PushOverrideSearchPath.
+ * GetSearchPathMatcher - fetch current search path definition.
  *
  * The result structure is allocated in the specified memory context
  * (which might or might not be equal to CurrentMemoryContext); but any
  * junk created by revalidation calculations will be in CurrentMemoryContext.
  */
-OverrideSearchPath *
-GetOverrideSearchPath(MemoryContext context)
+SearchPathMatcher *
+GetSearchPathMatcher(MemoryContext context)
 {
-	OverrideSearchPath *result;
+	SearchPathMatcher *result;
 	List	   *schemas;
 	MemoryContext oldcxt;
 
@@ -3366,7 +3391,7 @@ GetOverrideSearchPath(MemoryContext context)
 
 	oldcxt = MemoryContextSwitchTo(context);
 
-	result = (OverrideSearchPath *) palloc0(sizeof(OverrideSearchPath));
+	result = (SearchPathMatcher *) palloc0(sizeof(SearchPathMatcher));
 	schemas = list_copy(activeSearchPath);
 	while (schemas && linitial_oid(schemas) != activeCreationNamespace)
 	{
@@ -3388,16 +3413,16 @@ GetOverrideSearchPath(MemoryContext context)
 }
 
 /*
- * CopyOverrideSearchPath - copy the specified OverrideSearchPath.
+ * CopySearchPathMatcher - copy the specified SearchPathMatcher.
  *
  * The result structure is allocated in CurrentMemoryContext.
  */
-OverrideSearchPath *
-CopyOverrideSearchPath(OverrideSearchPath *path)
+SearchPathMatcher *
+CopySearchPathMatcher(SearchPathMatcher *path)
 {
-	OverrideSearchPath *result;
+	SearchPathMatcher *result;
 
-	result = (OverrideSearchPath *) palloc(sizeof(OverrideSearchPath));
+	result = (SearchPathMatcher *) palloc(sizeof(SearchPathMatcher));
 	result->schemas = list_copy(path->schemas);
 	result->addCatalog = path->addCatalog;
 	result->addTemp = path->addTemp;
@@ -3407,7 +3432,7 @@ CopyOverrideSearchPath(OverrideSearchPath *path)
 }
 
 /*
- * OverrideSearchPathMatchesCurrent - does path match current setting?
+ * SearchPathMatchesCurrentEnvironment - does path match current environment?
  *
  * This is tested over and over in some common code paths, and in the typical
  * scenario where the active search path seldom changes, it'll always succeed.
@@ -3415,7 +3440,7 @@ CopyOverrideSearchPath(OverrideSearchPath *path)
  * whenever the active search path changes.
  */
 bool
-OverrideSearchPathMatchesCurrent(OverrideSearchPath *path)
+SearchPathMatchesCurrentEnvironment(SearchPathMatcher *path)
 {
 	ListCell   *lc,
 			   *lcp;
@@ -3469,135 +3494,13 @@ OverrideSearchPathMatchesCurrent(OverrideSearchPath *path)
 }
 
 /*
- * PushOverrideSearchPath - temporarily override the search path
- *
- * We allow nested overrides, hence the push/pop terminology.  The GUC
- * search_path variable is ignored while an override is active.
- *
- * It's possible that newpath->useTemp is set but there is no longer any
- * active temp namespace, if the path was saved during a transaction that
- * created a temp namespace and was later rolled back.  In that case we just
- * ignore useTemp.  A plausible alternative would be to create a new temp
- * namespace, but for existing callers that's not necessary because an empty
- * temp namespace wouldn't affect their results anyway.
- *
- * It's also worth noting that other schemas listed in newpath might not
- * exist anymore either.  We don't worry about this because OIDs that match
- * no existing namespace will simply not produce any hits during searches.
- */
-void
-PushOverrideSearchPath(OverrideSearchPath *newpath)
-{
-	OverrideStackEntry *entry;
-	List	   *oidlist;
-	Oid			firstNS;
-	MemoryContext oldcxt;
-
-	/*
-	 * Copy the list for safekeeping, and insert implicitly-searched
-	 * namespaces as needed.  This code should track recomputeNamespacePath.
-	 */
-	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
-
-	oidlist = list_copy(newpath->schemas);
-
-	/*
-	 * Remember the first member of the explicit list.
-	 */
-	if (oidlist == NIL)
-		firstNS = InvalidOid;
-	else
-		firstNS = linitial_oid(oidlist);
-
-	/*
-	 * Add any implicitly-searched namespaces to the list.  Note these go on
-	 * the front, not the back; also notice that we do not check USAGE
-	 * permissions for these.
-	 */
-	if (newpath->addCatalog)
-		oidlist = lcons_oid(PG_CATALOG_NAMESPACE, oidlist);
-
-	if (newpath->addTemp && OidIsValid(myTempNamespace))
-		oidlist = lcons_oid(myTempNamespace, oidlist);
-
-	/*
-	 * Build the new stack entry, then insert it at the head of the list.
-	 */
-	entry = (OverrideStackEntry *) palloc(sizeof(OverrideStackEntry));
-	entry->searchPath = oidlist;
-	entry->creationNamespace = firstNS;
-	entry->nestLevel = GetCurrentTransactionNestLevel();
-
-	overrideStack = lcons(entry, overrideStack);
-
-	/* And make it active. */
-	activeSearchPath = entry->searchPath;
-	activeCreationNamespace = entry->creationNamespace;
-	activeTempCreationPending = false;	/* XXX is this OK? */
-
-	/*
-	 * We always increment activePathGeneration when pushing/popping an
-	 * override path.  In current usage, these actions always change the
-	 * effective path state, so there's no value in checking to see if it
-	 * didn't change.
-	 */
-	activePathGeneration++;
-
-	MemoryContextSwitchTo(oldcxt);
-}
-
-/*
- * PopOverrideSearchPath - undo a previous PushOverrideSearchPath
- *
- * Any push during a (sub)transaction will be popped automatically at abort.
- * But it's caller error if a push isn't popped in normal control flow.
- */
-void
-PopOverrideSearchPath(void)
-{
-	OverrideStackEntry *entry;
-
-	/* Sanity checks. */
-	if (overrideStack == NIL)
-		elog(ERROR, "bogus PopOverrideSearchPath call");
-	entry = (OverrideStackEntry *) linitial(overrideStack);
-	if (entry->nestLevel != GetCurrentTransactionNestLevel())
-		elog(ERROR, "bogus PopOverrideSearchPath call");
-
-	/* Pop the stack and free storage. */
-	overrideStack = list_delete_first(overrideStack);
-	list_free(entry->searchPath);
-	pfree(entry);
-
-	/* Activate the next level down. */
-	if (overrideStack)
-	{
-		entry = (OverrideStackEntry *) linitial(overrideStack);
-		activeSearchPath = entry->searchPath;
-		activeCreationNamespace = entry->creationNamespace;
-		activeTempCreationPending = false;	/* XXX is this OK? */
-	}
-	else
-	{
-		/* If not baseSearchPathValid, this is useless but harmless */
-		activeSearchPath = baseSearchPath;
-		activeCreationNamespace = baseCreationNamespace;
-		activeTempCreationPending = baseTempCreationPending;
-	}
-
-	/* As above, the generation always increments. */
-	activePathGeneration++;
-}
-
-
-/*
  * get_collation_oid - find a collation by possibly qualified name
  *
  * Note that this will only find collations that work with the current
  * database's encoding.
  */
 Oid
-get_collation_oid(List *name, bool missing_ok)
+get_collation_oid(List *collname, bool missing_ok)
 {
 	char	   *schemaname;
 	char	   *collation_name;
@@ -3607,7 +3510,7 @@ get_collation_oid(List *name, bool missing_ok)
 	ListCell   *l;
 
 	/* deconstruct the name list */
-	DeconstructQualifiedName(name, &schemaname, &collation_name);
+	DeconstructQualifiedName(collname, &schemaname, &collation_name);
 
 	if (schemaname)
 	{
@@ -3643,7 +3546,7 @@ get_collation_oid(List *name, bool missing_ok)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("collation \"%s\" for encoding \"%s\" does not exist",
-						NameListToString(name), GetDatabaseEncodingName())));
+						NameListToString(collname), GetDatabaseEncodingName())));
 	return InvalidOid;
 }
 
@@ -3651,7 +3554,7 @@ get_collation_oid(List *name, bool missing_ok)
  * get_conversion_oid - find a conversion by possibly qualified name
  */
 Oid
-get_conversion_oid(List *name, bool missing_ok)
+get_conversion_oid(List *conname, bool missing_ok)
 {
 	char	   *schemaname;
 	char	   *conversion_name;
@@ -3660,7 +3563,7 @@ get_conversion_oid(List *name, bool missing_ok)
 	ListCell   *l;
 
 	/* deconstruct the name list */
-	DeconstructQualifiedName(name, &schemaname, &conversion_name);
+	DeconstructQualifiedName(conname, &schemaname, &conversion_name);
 
 	if (schemaname)
 	{
@@ -3698,7 +3601,7 @@ get_conversion_oid(List *name, bool missing_ok)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("conversion \"%s\" does not exist",
-						NameListToString(name))));
+						NameListToString(conname))));
 	return conoid;
 }
 
@@ -3746,10 +3649,6 @@ recomputeNamespacePath(void)
 	bool		pathChanged;
 	MemoryContext oldcxt;
 
-	/* Do nothing if an override search spec is active. */
-	if (overrideStack)
-		return;
-
 	/* Do nothing if path is already valid. */
 	if (baseSearchPathValid && namespaceUser == roleid)
 		return;
@@ -3793,8 +3692,8 @@ recomputeNamespacePath(void)
 				ReleaseSysCache(tuple);
 				if (OidIsValid(namespaceId) &&
 					!list_member_oid(oidlist, namespaceId) &&
-					pg_namespace_aclcheck(namespaceId, roleid,
-										  ACL_USAGE) == ACLCHECK_OK &&
+					object_aclcheck(NamespaceRelationId, namespaceId, roleid,
+									ACL_USAGE) == ACLCHECK_OK &&
 					InvokeNamespaceSearchHook(namespaceId, false))
 					oidlist = lappend_oid(oidlist, namespaceId);
 			}
@@ -3821,8 +3720,8 @@ recomputeNamespacePath(void)
 			namespaceId = get_namespace_oid(curname, true);
 			if (OidIsValid(namespaceId) &&
 				!list_member_oid(oidlist, namespaceId) &&
-				pg_namespace_aclcheck(namespaceId, roleid,
-									  ACL_USAGE) == ACLCHECK_OK &&
+				object_aclcheck(NamespaceRelationId, namespaceId, roleid,
+								ACL_USAGE) == ACLCHECK_OK &&
 				InvokeNamespaceSearchHook(namespaceId, false))
 				oidlist = lappend_oid(oidlist, namespaceId);
 		}
@@ -3888,10 +3787,7 @@ recomputeNamespacePath(void)
 
 	/*
 	 * Bump the generation only if something actually changed.  (Notice that
-	 * what we compared to was the old state of the base path variables; so
-	 * this does not deal with the situation where we have just popped an
-	 * override path and restored the prior state of the base path.  Instead
-	 * we rely on the override-popping logic to have bumped the generation.)
+	 * what we compared to was the old state of the base path variables.)
 	 */
 	if (pathChanged)
 		activePathGeneration++;
@@ -3957,8 +3853,8 @@ InitTempTableNamespace(void)
 	 * But there's no need to make the namespace in the first place until a
 	 * temp table creation request is made by someone with appropriate rights.
 	 */
-	if (pg_database_aclcheck(MyDatabaseId, GetUserId(),
-							 ACL_CREATE_TEMP) != ACLCHECK_OK)
+	if (object_aclcheck(DatabaseRelationId, MyDatabaseId, GetUserId(),
+						ACL_CREATE_TEMP) != ACLCHECK_OK)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to create temporary tables in database \"%s\"",
@@ -4050,7 +3946,7 @@ InitTempTableNamespace(void)
 	MyProc->tempNamespaceId = namespaceId;
 
 	/* It should not be done already. */
-	AssertState(myTempNamespaceSubID == InvalidSubTransactionId);
+	Assert(myTempNamespaceSubID == InvalidSubTransactionId);
 	myTempNamespaceSubID = GetCurrentSubTransactionId();
 
 	baseSearchPathValid = false;	/* need to rebuild list */
@@ -4094,29 +3990,6 @@ AtEOXact_Namespace(bool isCommit, bool parallel)
 		myTempNamespaceSubID = InvalidSubTransactionId;
 	}
 
-	/*
-	 * Clean up if someone failed to do PopOverrideSearchPath
-	 */
-	if (overrideStack)
-	{
-		if (isCommit)
-			elog(WARNING, "leaked override search path");
-		while (overrideStack)
-		{
-			OverrideStackEntry *entry;
-
-			entry = (OverrideStackEntry *) linitial(overrideStack);
-			overrideStack = list_delete_first(overrideStack);
-			list_free(entry->searchPath);
-			pfree(entry);
-		}
-		/* If not baseSearchPathValid, this is useless but harmless */
-		activeSearchPath = baseSearchPath;
-		activeCreationNamespace = baseCreationNamespace;
-		activeTempCreationPending = baseTempCreationPending;
-		/* Always bump generation --- see note in recomputeNamespacePath */
-		activePathGeneration++;
-	}
 }
 
 /*
@@ -4131,7 +4004,6 @@ void
 AtEOSubXact_Namespace(bool isCommit, SubTransactionId mySubid,
 					  SubTransactionId parentSubid)
 {
-	OverrideStackEntry *entry;
 
 	if (myTempNamespaceSubID == mySubid)
 	{
@@ -4156,51 +4028,6 @@ AtEOSubXact_Namespace(bool isCommit, SubTransactionId mySubid,
 			 */
 			MyProc->tempNamespaceId = InvalidOid;
 		}
-	}
-
-	/*
-	 * Clean up if someone failed to do PopOverrideSearchPath
-	 */
-	while (overrideStack)
-	{
-		entry = (OverrideStackEntry *) linitial(overrideStack);
-		if (entry->nestLevel < GetCurrentTransactionNestLevel())
-			break;
-		if (isCommit)
-			elog(WARNING, "leaked override search path");
-		overrideStack = list_delete_first(overrideStack);
-		list_free(entry->searchPath);
-		pfree(entry);
-		/* Always bump generation --- see note in recomputeNamespacePath */
-		activePathGeneration++;
-	}
-
-	/* Activate the next level down. */
-	if (overrideStack)
-	{
-		entry = (OverrideStackEntry *) linitial(overrideStack);
-		activeSearchPath = entry->searchPath;
-		activeCreationNamespace = entry->creationNamespace;
-		activeTempCreationPending = false;	/* XXX is this OK? */
-
-		/*
-		 * It's probably unnecessary to bump generation here, but this should
-		 * not be a performance-critical case, so better to be over-cautious.
-		 */
-		activePathGeneration++;
-	}
-	else
-	{
-		/* If not baseSearchPathValid, this is useless but harmless */
-		activeSearchPath = baseSearchPath;
-		activeCreationNamespace = baseCreationNamespace;
-		activeTempCreationPending = baseTempCreationPending;
-
-		/*
-		 * If we popped an override stack entry, then we already bumped the
-		 * generation above.  If we did not, then the above assignments did
-		 * nothing and we need not bump the generation.
-		 */
 	}
 }
 
@@ -4246,9 +4073,11 @@ RemoveTempRelationsCallback(int code, Datum arg)
 		/* Need to ensure we have a usable transaction. */
 		AbortOutOfAnyTransaction();
 		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
 
 		RemoveTempRelations(myTempNamespace);
 
+		PopActiveSnapshot();
 		CommitTransactionCommand();
 	}
 }
@@ -4346,9 +4175,13 @@ InitializeSearchPath(void)
 	{
 		/*
 		 * In normal mode, arrange for a callback on any syscache invalidation
-		 * of pg_namespace rows.
+		 * of pg_namespace or pg_authid rows. (Changing a role name may affect
+		 * the meaning of the special string $user.)
 		 */
 		CacheRegisterSyscacheCallback(NAMESPACEOID,
+									  NamespaceCallback,
+									  (Datum) 0);
+		CacheRegisterSyscacheCallback(AUTHOID,
 									  NamespaceCallback,
 									  (Datum) 0);
 		/* Force search path to be recomputed on next use */

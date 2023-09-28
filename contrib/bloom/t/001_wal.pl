@@ -1,12 +1,12 @@
 
-# Copyright (c) 2021, PostgreSQL Global Development Group
+# Copyright (c) 2021-2023, PostgreSQL Global Development Group
 
 # Test generic xlog record work for bloom index replication.
 use strict;
 use warnings;
-use PostgresNode;
-use TestLib;
-use Test::More tests => 31;
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
 
 my $node_primary;
 my $node_standby;
@@ -16,12 +16,10 @@ sub test_index_replay
 {
 	my ($test_name) = @_;
 
+	local $Test::Builder::Level = $Test::Builder::Level + 1;
+
 	# Wait for standby to catch up
-	my $applname = $node_standby->name;
-	my $caughtup_query =
-	  "SELECT pg_current_wal_lsn() <= write_lsn FROM pg_stat_replication WHERE application_name = '$applname';";
-	$node_primary->poll_query_until('postgres', $caughtup_query)
-	  or die "Timed out while waiting for standby 1 to catch up";
+	$node_primary->wait_for_catchup($node_standby);
 
 	my $queries = qq(SET enable_seqscan=off;
 SET enable_bitmapscan=on;
@@ -43,7 +41,7 @@ SELECT * FROM tst WHERE i = 7 AND t = 'e';
 }
 
 # Initialize primary node
-$node_primary = get_new_node('primary');
+$node_primary = PostgreSQL::Test::Cluster->new('primary');
 $node_primary->init(allows_streaming => 1);
 $node_primary->start;
 my $backup_name = 'my_backup';
@@ -52,7 +50,7 @@ my $backup_name = 'my_backup';
 $node_primary->backup($backup_name);
 
 # Create streaming standby linking to primary
-$node_standby = get_new_node('standby');
+$node_standby = PostgreSQL::Test::Cluster->new('standby');
 $node_standby->init_from_backup($node_primary, $backup_name,
 	has_streaming => 1);
 $node_standby->start;
@@ -61,7 +59,7 @@ $node_standby->start;
 $node_primary->safe_psql("postgres", "CREATE EXTENSION bloom;");
 $node_primary->safe_psql("postgres", "CREATE TABLE tst (i int4, t text);");
 $node_primary->safe_psql("postgres",
-	"INSERT INTO tst SELECT i%10, substr(md5(i::text), 1, 1) FROM generate_series(1,100000) i;"
+	"INSERT INTO tst SELECT i%10, substr(encode(sha256(i::text::bytea), 'hex'), 1, 1) FROM generate_series(1,10000) i;"
 );
 $node_primary->safe_psql("postgres",
 	"CREATE INDEX bloomidx ON tst USING bloom (i, t) WITH (col1 = 3);");
@@ -78,7 +76,9 @@ for my $i (1 .. 10)
 	test_index_replay("vacuum $i");
 	my ($start, $end) = (100001 + ($i - 1) * 10000, 100000 + $i * 10000);
 	$node_primary->safe_psql("postgres",
-		"INSERT INTO tst SELECT i%10, substr(md5(i::text), 1, 1) FROM generate_series($start,$end) i;"
+		"INSERT INTO tst SELECT i%10, substr(encode(sha256(i::text::bytea), 'hex'), 1, 1) FROM generate_series($start,$end) i;"
 	);
 	test_index_replay("insert $i");
 }
+
+done_testing();

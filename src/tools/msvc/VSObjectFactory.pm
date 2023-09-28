@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021, PostgreSQL Global Development Group
+# Copyright (c) 2021-2023, PostgreSQL Global Development Group
 
 package VSObjectFactory;
 
@@ -19,7 +19,7 @@ use Solution;
 use MSBuildProject;
 
 our (@ISA, @EXPORT);
-@ISA    = qw(Exporter);
+@ISA = qw(Exporter);
 @EXPORT = qw(CreateSolution CreateProject DetermineVisualStudioVersion);
 
 no warnings qw(redefine);    ## no critic
@@ -33,11 +33,7 @@ sub CreateSolution
 		$visualStudioVersion = DetermineVisualStudioVersion();
 	}
 
-	if ($visualStudioVersion eq '12.00')
-	{
-		return new VS2013Solution(@_);
-	}
-	elsif ($visualStudioVersion eq '14.00')
+	if ($visualStudioVersion eq '14.00')
 	{
 		return new VS2015Solution(@_);
 	}
@@ -61,6 +57,16 @@ sub CreateSolution
 	{
 		return new VS2019Solution(@_);
 	}
+
+	# The version of nmake bundled in Visual Studio 2022 is greater
+	# than 14.30 and less than 14.40.  And the version number is
+	# actually 17.00.
+	elsif (
+		($visualStudioVersion ge '14.30' && $visualStudioVersion lt '14.40')
+		|| $visualStudioVersion eq '17.00')
+	{
+		return new VS2022Solution(@_);
+	}
 	else
 	{
 		croak
@@ -77,11 +83,7 @@ sub CreateProject
 		$visualStudioVersion = DetermineVisualStudioVersion();
 	}
 
-	if ($visualStudioVersion eq '12.00')
-	{
-		return new VC2013Project(@_);
-	}
-	elsif ($visualStudioVersion eq '14.00')
+	if ($visualStudioVersion eq '14.00')
 	{
 		return new VC2015Project(@_);
 	}
@@ -104,6 +106,16 @@ sub CreateProject
 		|| $visualStudioVersion eq '16.00')
 	{
 		return new VC2019Project(@_);
+	}
+
+	# The version of nmake bundled in Visual Studio 2022 is greater
+	# than 14.30 and less than 14.40.  And the version number is
+	# actually 17.00.
+	elsif (
+		($visualStudioVersion ge '14.30' && $visualStudioVersion lt '14.40')
+		|| $visualStudioVersion eq '17.00')
+	{
+		return new VC2022Project(@_);
 	}
 	else
 	{
@@ -134,7 +146,7 @@ sub DetermineVisualStudioVersion
 	else
 	{
 		# fake version
-		return '16.00';
+		return '17.00';
 	}
 }
 
@@ -143,13 +155,13 @@ sub _GetVisualStudioVersion
 	my ($major, $minor) = @_;
 
 	# The major visual studio that is supported has nmake
-	# version <= 14.30, so stick with it as the latest version
+	# version <= 14.40, so stick with it as the latest version
 	# if bumping on something even newer.
-	if ($major >= 14 && $minor >= 30)
+	if ($major >= 14 && $minor >= 40)
 	{
 		carp
 		  "The determined version of Visual Studio is newer than the latest supported version. Returning the latest supported version instead.";
-		return '14.20';
+		return '14.30';
 	}
 	elsif ($major < 12)
 	{

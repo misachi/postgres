@@ -4,7 +4,7 @@
  *	  Routines to support inter-object dependencies.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -18,6 +18,7 @@
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
+#include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
@@ -27,6 +28,7 @@
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_attrdef.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_auth_members.h"
 #include "catalog/pg_cast.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
@@ -45,9 +47,11 @@
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_opfamily.h"
+#include "catalog/pg_parameter_acl.h"
 #include "catalog/pg_policy.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_publication.h"
+#include "catalog/pg_publication_namespace.h"
 #include "catalog/pg_publication_rel.h"
 #include "catalog/pg_rewrite.h"
 #include "catalog/pg_statistic_ext.h"
@@ -71,6 +75,7 @@
 #include "commands/sequence.h"
 #include "commands/trigger.h"
 #include "commands/typecmds.h"
+#include "funcapi.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parsetree.h"
 #include "rewrite/rewriteRemove.h"
@@ -168,6 +173,7 @@ static const Oid object_classes[] = {
 	TSTemplateRelationId,		/* OCLASS_TSTEMPLATE */
 	TSConfigRelationId,			/* OCLASS_TSCONFIG */
 	AuthIdRelationId,			/* OCLASS_ROLE */
+	AuthMemRelationId,			/* OCLASS_ROLE_MEMBERSHIP */
 	DatabaseRelationId,			/* OCLASS_DATABASE */
 	TableSpaceRelationId,		/* OCLASS_TBLSPACE */
 	ForeignDataWrapperRelationId,	/* OCLASS_FDW */
@@ -176,12 +182,20 @@ static const Oid object_classes[] = {
 	DefaultAclRelationId,		/* OCLASS_DEFACL */
 	ExtensionRelationId,		/* OCLASS_EXTENSION */
 	EventTriggerRelationId,		/* OCLASS_EVENT_TRIGGER */
+	ParameterAclRelationId,		/* OCLASS_PARAMETER_ACL */
 	PolicyRelationId,			/* OCLASS_POLICY */
+	PublicationNamespaceRelationId, /* OCLASS_PUBLICATION_NAMESPACE */
 	PublicationRelationId,		/* OCLASS_PUBLICATION */
 	PublicationRelRelationId,	/* OCLASS_PUBLICATION_REL */
 	SubscriptionRelationId,		/* OCLASS_SUBSCRIPTION */
 	TransformRelationId			/* OCLASS_TRANSFORM */
 };
+
+/*
+ * Make sure object_classes is kept up to date with the ObjectClass enum.
+ */
+StaticAssertDecl(lengthof(object_classes) == LAST_OCLASS + 1,
+				 "object_classes[] must cover all ObjectClasses");
 
 
 static void findDependentObjects(const ObjectAddress *object,
@@ -200,6 +214,8 @@ static void deleteOneObject(const ObjectAddress *object,
 static void doDeletion(const ObjectAddress *object, int flags);
 static bool find_expr_references_walker(Node *node,
 										find_expr_references_context *context);
+static void process_function_rte_ref(RangeTblEntry *rte, AttrNumber attnum,
+									 find_expr_references_context *context);
 static void eliminate_duplicate_dependencies(ObjectAddresses *addrs);
 static int	object_address_comparator(const void *a, const void *b);
 static void add_object_address(ObjectClass oclass, Oid objectId, int32 subId,
@@ -521,6 +537,16 @@ findDependentObjects(const ObjectAddress *object,
 		return;
 
 	/*
+	 * If the target object is pinned, we can just error out immediately; it
+	 * won't have any objects recorded as depending on it.
+	 */
+	if (IsPinnedObject(object->classId, object->objectId))
+		ereport(ERROR,
+				(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+				 errmsg("cannot drop %s because it is required by the database system",
+						getObjectDescription(object, false))));
+
+	/*
 	 * The target object might be internally dependent on some other object
 	 * (its "owner"), and/or be a member of an extension (also considered its
 	 * owner).  If so, and if we aren't recursing from the owning object, we
@@ -783,15 +809,6 @@ findDependentObjects(const ObjectAddress *object,
 				objflags |= DEPFLAG_IS_PART;
 				break;
 
-			case DEPENDENCY_PIN:
-
-				/*
-				 * Should not happen; PIN dependencies should have zeroes in
-				 * the depender fields...
-				 */
-				elog(ERROR, "incorrect use of PIN dependency with %s",
-					 getObjectDescription(object, false));
-				break;
 			default:
 				elog(ERROR, "unrecognized dependency type '%c' for %s",
 					 foundDep->deptype, getObjectDescription(object, false));
@@ -920,18 +937,6 @@ findDependentObjects(const ObjectAddress *object,
 			case DEPENDENCY_EXTENSION:
 				subflags = DEPFLAG_EXTENSION;
 				break;
-			case DEPENDENCY_PIN:
-
-				/*
-				 * For a PIN dependency we just ereport immediately; there
-				 * won't be any others to report.
-				 */
-				ereport(ERROR,
-						(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
-						 errmsg("cannot drop %s because it is required by the database system",
-								getObjectDescription(object, false))));
-				subflags = 0;	/* keep compiler quiet */
-				break;
 			default:
 				elog(ERROR, "unrecognized dependency type '%c' for %s",
 					 foundDep->deptype, getObjectDescription(object, false));
@@ -962,7 +967,7 @@ findDependentObjects(const ObjectAddress *object,
 	 * first within ObjectAddressAndFlags.
 	 */
 	if (numDependentObjects > 1)
-		qsort((void *) dependentObjects, numDependentObjects,
+		qsort(dependentObjects, numDependentObjects,
 			  sizeof(ObjectAddressAndFlags),
 			  object_address_comparator);
 
@@ -1102,6 +1107,10 @@ reportDependentObjects(const ObjectAddresses *targetObjects,
 
 		objDesc = getObjectDescription(obj, false);
 
+		/* An object being dropped concurrently doesn't need to be reported */
+		if (objDesc == NULL)
+			continue;
+
 		/*
 		 * If, at any stage of the recursive search, we reached the object via
 		 * an AUTO, INTERNAL, PARTITION, or EXTENSION dependency, then it's
@@ -1127,23 +1136,28 @@ reportDependentObjects(const ObjectAddresses *targetObjects,
 			char	   *otherDesc = getObjectDescription(&extra->dependee,
 														 false);
 
-			if (numReportedClient < MAX_REPORTED_DEPS)
+			if (otherDesc)
 			{
+				if (numReportedClient < MAX_REPORTED_DEPS)
+				{
+					/* separate entries with a newline */
+					if (clientdetail.len != 0)
+						appendStringInfoChar(&clientdetail, '\n');
+					appendStringInfo(&clientdetail, _("%s depends on %s"),
+									 objDesc, otherDesc);
+					numReportedClient++;
+				}
+				else
+					numNotReportedClient++;
 				/* separate entries with a newline */
-				if (clientdetail.len != 0)
-					appendStringInfoChar(&clientdetail, '\n');
-				appendStringInfo(&clientdetail, _("%s depends on %s"),
+				if (logdetail.len != 0)
+					appendStringInfoChar(&logdetail, '\n');
+				appendStringInfo(&logdetail, _("%s depends on %s"),
 								 objDesc, otherDesc);
-				numReportedClient++;
+				pfree(otherDesc);
 			}
 			else
 				numNotReportedClient++;
-			/* separate entries with a newline */
-			if (logdetail.len != 0)
-				appendStringInfoChar(&logdetail, '\n');
-			appendStringInfo(&logdetail, _("%s depends on %s"),
-							 objDesc, otherDesc);
-			pfree(otherDesc);
 			ok = false;
 		}
 		else
@@ -1184,26 +1198,25 @@ reportDependentObjects(const ObjectAddresses *targetObjects,
 					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
 					 errmsg("cannot drop %s because other objects depend on it",
 							getObjectDescription(origObject, false)),
-					 errdetail("%s", clientdetail.data),
+					 errdetail_internal("%s", clientdetail.data),
 					 errdetail_log("%s", logdetail.data),
 					 errhint("Use DROP ... CASCADE to drop the dependent objects too.")));
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
 					 errmsg("cannot drop desired object(s) because other objects depend on them"),
-					 errdetail("%s", clientdetail.data),
+					 errdetail_internal("%s", clientdetail.data),
 					 errdetail_log("%s", logdetail.data),
 					 errhint("Use DROP ... CASCADE to drop the dependent objects too.")));
 	}
 	else if (numReportedClient > 1)
 	{
 		ereport(msglevel,
-		/* translator: %d always has a value larger than 1 */
 				(errmsg_plural("drop cascades to %d other object",
 							   "drop cascades to %d other objects",
 							   numReportedClient + numNotReportedClient,
 							   numReportedClient + numNotReportedClient),
-				 errdetail("%s", clientdetail.data),
+				 errdetail_internal("%s", clientdetail.data),
 				 errdetail_log("%s", logdetail.data)));
 	}
 	else if (numReportedClient == 1)
@@ -1466,8 +1479,16 @@ doDeletion(const ObjectAddress *object, int flags)
 			RemovePolicyById(object->objectId);
 			break;
 
+		case OCLASS_PUBLICATION_NAMESPACE:
+			RemovePublicationSchemaById(object->objectId);
+			break;
+
 		case OCLASS_PUBLICATION_REL:
 			RemovePublicationRelById(object->objectId);
+			break;
+
+		case OCLASS_PUBLICATION:
+			RemovePublicationById(object->objectId);
 			break;
 
 		case OCLASS_CAST:
@@ -1488,8 +1509,8 @@ doDeletion(const ObjectAddress *object, int flags)
 		case OCLASS_USER_MAPPING:
 		case OCLASS_DEFACL:
 		case OCLASS_EVENT_TRIGGER:
-		case OCLASS_PUBLICATION:
 		case OCLASS_TRANSFORM:
+		case OCLASS_ROLE_MEMBERSHIP:
 			DropObjectById(object);
 			break;
 
@@ -1500,6 +1521,7 @@ doDeletion(const ObjectAddress *object, int flags)
 		case OCLASS_DATABASE:
 		case OCLASS_TBLSPACE:
 		case OCLASS_SUBSCRIPTION:
+		case OCLASS_PARAMETER_ACL:
 			elog(ERROR, "global objects cannot be deleted by doDeletion");
 			break;
 
@@ -1516,9 +1538,8 @@ doDeletion(const ObjectAddress *object, int flags)
  * Accepts the same flags as performDeletion (though currently only
  * PERFORM_DELETION_CONCURRENTLY does anything).
  *
- * We use LockRelation for relations, LockDatabaseObject for everything
- * else.  Shared-across-databases objects are not currently supported
- * because no caller cares, but could be modified to use LockSharedObject.
+ * We use LockRelation for relations, and otherwise LockSharedObject or
+ * LockDatabaseObject as appropriate for the object type.
  */
 void
 AcquireDeletionLock(const ObjectAddress *object, int flags)
@@ -1536,6 +1557,9 @@ AcquireDeletionLock(const ObjectAddress *object, int flags)
 		else
 			LockRelationOid(object->objectId, AccessExclusiveLock);
 	}
+	else if (object->classId == AuthMemRelationId)
+		LockSharedObject(object->classId, object->objectId, 0,
+						 AccessExclusiveLock);
 	else
 	{
 		/* assume we should lock the whole object not a sub-object */
@@ -1625,12 +1649,11 @@ recordDependencyOnSingleRelExpr(const ObjectAddress *depender,
 								bool reverse_self)
 {
 	find_expr_references_context context;
-	RangeTblEntry rte;
+	RangeTblEntry rte = {0};
 
 	context.addrs = new_object_addresses();
 
 	/* We gin up a rather bogus rangetable list to handle Vars */
-	MemSet(&rte, 0, sizeof(rte));
 	rte.type = T_RangeTblEntry;
 	rte.rtekind = RTE_RELATION;
 	rte.relid = relId;
@@ -1759,6 +1782,12 @@ find_expr_references_walker(Node *node,
 			add_object_address(OCLASS_CLASS, rte->relid, var->varattno,
 							   context->addrs);
 		}
+		else if (rte->rtekind == RTE_FUNCTION)
+		{
+			/* Might need to add a dependency on a composite type's column */
+			/* (done out of line, because it's a bit bulky) */
+			process_function_rte_ref(rte, var->varattno, context);
+		}
 
 		/*
 		 * Vars referencing other RTE types require no additional work.  In
@@ -1828,6 +1857,13 @@ find_expr_references_walker(Node *node,
 					if (SearchSysCacheExists1(TYPEOID,
 											  ObjectIdGetDatum(objoid)))
 						add_object_address(OCLASS_TYPE, objoid, 0,
+										   context->addrs);
+					break;
+				case REGCOLLATIONOID:
+					objoid = DatumGetObjectId(con->constvalue);
+					if (SearchSysCacheExists1(COLLOID,
+											  ObjectIdGetDatum(objoid)))
+						add_object_address(OCLASS_COLLATION, objoid, 0,
 										   context->addrs);
 					break;
 				case REGCONFIGOID:
@@ -2327,6 +2363,65 @@ find_expr_references_walker(Node *node,
 }
 
 /*
+ * find_expr_references_walker subroutine: handle a Var reference
+ * to an RTE_FUNCTION RTE
+ */
+static void
+process_function_rte_ref(RangeTblEntry *rte, AttrNumber attnum,
+						 find_expr_references_context *context)
+{
+	int			atts_done = 0;
+	ListCell   *lc;
+
+	/*
+	 * Identify which RangeTblFunction produces this attnum, and see if it
+	 * returns a composite type.  If so, we'd better make a dependency on the
+	 * referenced column of the composite type (or actually, of its associated
+	 * relation).
+	 */
+	foreach(lc, rte->functions)
+	{
+		RangeTblFunction *rtfunc = (RangeTblFunction *) lfirst(lc);
+
+		if (attnum > atts_done &&
+			attnum <= atts_done + rtfunc->funccolcount)
+		{
+			TupleDesc	tupdesc;
+
+			tupdesc = get_expr_result_tupdesc(rtfunc->funcexpr, true);
+			if (tupdesc && tupdesc->tdtypeid != RECORDOID)
+			{
+				/*
+				 * Named composite type, so individual columns could get
+				 * dropped.  Make a dependency on this specific column.
+				 */
+				Oid			reltype = get_typ_typrelid(tupdesc->tdtypeid);
+
+				Assert(attnum - atts_done <= tupdesc->natts);
+				if (OidIsValid(reltype))	/* can this fail? */
+					add_object_address(OCLASS_CLASS, reltype,
+									   attnum - atts_done,
+									   context->addrs);
+				return;
+			}
+			/* Nothing to do; function's result type is handled elsewhere */
+			return;
+		}
+		atts_done += rtfunc->funccolcount;
+	}
+
+	/* If we get here, must be looking for the ordinality column */
+	if (rte->funcordinality && attnum == atts_done + 1)
+		return;
+
+	/* this probably can't happen ... */
+	ereport(ERROR,
+			(errcode(ERRCODE_UNDEFINED_COLUMN),
+			 errmsg("column %d of relation \"%s\" does not exist",
+					attnum, rte->eref->aliasname)));
+}
+
+/*
  * Given an array of dependency references, eliminate any duplicates.
  */
 static void
@@ -2347,7 +2442,7 @@ eliminate_duplicate_dependencies(ObjectAddresses *addrs)
 		return;					/* nothing to do */
 
 	/* Sort the refs so that duplicates are adjacent */
-	qsort((void *) addrs->refs, addrs->numrefs, sizeof(ObjectAddress),
+	qsort(addrs->refs, addrs->numrefs, sizeof(ObjectAddress),
 		  object_address_comparator);
 
 	/* Remove dups */
@@ -2460,12 +2555,6 @@ add_object_address(ObjectClass oclass, Oid objectId, int32 subId,
 				   ObjectAddresses *addrs)
 {
 	ObjectAddress *item;
-
-	/*
-	 * Make sure object_classes is kept up to date with the ObjectClass enum.
-	 */
-	StaticAssertStmt(lengthof(object_classes) == LAST_OCLASS + 1,
-					 "object_classes[] must cover all ObjectClasses");
 
 	/* enlarge array if needed */
 	if (addrs->numrefs >= addrs->maxrefs)
@@ -2720,7 +2809,7 @@ void
 sort_object_addresses(ObjectAddresses *addrs)
 {
 	if (addrs->numrefs > 1)
-		qsort((void *) addrs->refs, addrs->numrefs,
+		qsort(addrs->refs, addrs->numrefs,
 			  sizeof(ObjectAddress),
 			  object_address_comparator);
 }
@@ -2830,6 +2919,9 @@ getObjectClass(const ObjectAddress *object)
 		case AuthIdRelationId:
 			return OCLASS_ROLE;
 
+		case AuthMemRelationId:
+			return OCLASS_ROLE_MEMBERSHIP;
+
 		case DatabaseRelationId:
 			return OCLASS_DATABASE;
 
@@ -2854,8 +2946,14 @@ getObjectClass(const ObjectAddress *object)
 		case EventTriggerRelationId:
 			return OCLASS_EVENT_TRIGGER;
 
+		case ParameterAclRelationId:
+			return OCLASS_PARAMETER_ACL;
+
 		case PolicyRelationId:
 			return OCLASS_POLICY;
+
+		case PublicationNamespaceRelationId:
+			return OCLASS_PUBLICATION_NAMESPACE;
 
 		case PublicationRelationId:
 			return OCLASS_PUBLICATION;

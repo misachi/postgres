@@ -13,7 +13,7 @@ select count(*) >= 0 as ok from pg_available_extension_versions;
 select count(*) >= 0 as ok from pg_available_extensions;
 
 -- The entire output of pg_backend_memory_contexts is not stable,
--- we test only the existance and basic condition of TopMemoryContext.
+-- we test only the existence and basic condition of TopMemoryContext.
 select name, ident, parent, level, total_bytes >= free_bytes
   from pg_backend_memory_contexts where level = 0;
 
@@ -25,8 +25,13 @@ select count(*) = 0 as ok from pg_cursors;
 
 select count(*) >= 0 as ok from pg_file_settings;
 
--- There will surely be at least one rule
-select count(*) > 0 as ok from pg_hba_file_rules;
+-- There will surely be at least one rule, with no errors.
+select count(*) > 0 as ok, count(*) FILTER (WHERE error IS NOT NULL) = 0 AS no_err
+  from pg_hba_file_rules;
+
+-- There may be no rules, and there should be no errors.
+select count(*) >= 0 as ok, count(*) FILTER (WHERE error IS NOT NULL) = 0 AS no_err
+  from pg_ident_file_mappings;
 
 -- There will surely be at least one active lock
 select count(*) > 0 as ok from pg_locks;
@@ -37,6 +42,9 @@ select count(*) = 0 as ok from pg_prepared_statements;
 -- See also prepared_xacts.sql
 select count(*) >= 0 as ok from pg_prepared_xacts;
 
+-- There will surely be at least one SLRU cache
+select count(*) > 0 as ok from pg_stat_slru;
+
 -- There must be only one record
 select count(*) = 1 as ok from pg_stat_wal;
 
@@ -46,6 +54,10 @@ select count(*) = 0 as ok from pg_stat_wal_receiver;
 -- This is to record the prevailing planner enable_foo settings during
 -- a regression test run.
 select name, setting from pg_settings where name like 'enable%';
+
+-- There are always wait event descriptions for various types.
+select type, count(*) > 0 as ok FROM pg_wait_events
+  group by type order by type COLLATE "C";
 
 -- Test that the pg_timezone_names and pg_timezone_abbrevs views are
 -- more-or-less working.  We can't test their contents in any great detail

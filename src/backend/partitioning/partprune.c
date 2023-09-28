@@ -25,7 +25,7 @@
  *
  * See gen_partprune_steps_internal() for more details on step generation.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -201,7 +201,8 @@ static PruneStepResult *perform_pruning_combine_step(PartitionPruneContext *cont
 static PartClauseMatchStatus match_boolean_partition_clause(Oid partopfamily,
 															Expr *clause,
 															Expr *partkey,
-															Expr **outconst);
+															Expr **outconst,
+															bool *noteq);
 static void partkey_datum_from_expr(PartitionPruneContext *context,
 									Expr *expr, int stateidx,
 									Datum *value, bool *isnull);
@@ -529,8 +530,8 @@ make_partitionedrel_pruneinfo(PlannerInfo *root, RelOptInfo *parentrel,
 			partprunequal = (List *)
 				adjust_appendrel_attrs_multilevel(root,
 												  (Node *) prunequal,
-												  subpart->relids,
-												  targetpart->relids);
+												  subpart,
+												  targetpart);
 		}
 
 		/*
@@ -654,15 +655,14 @@ make_partitionedrel_pruneinfo(PlannerInfo *root, RelOptInfo *parentrel,
 		relid_map = (Oid *) palloc0(nparts * sizeof(Oid));
 		present_parts = NULL;
 
-		for (i = 0; i < nparts; i++)
+		i = -1;
+		while ((i = bms_next_member(subpart->live_parts, i)) >= 0)
 		{
 			RelOptInfo *partrel = subpart->part_rels[i];
 			int			subplanidx;
 			int			subpartidx;
 
-			/* Skip processing pruned partitions. */
-			if (partrel == NULL)
-				continue;
+			Assert(partrel != NULL);
 
 			subplan_map[i] = subplanidx = relid_subplan_map[partrel->relid] - 1;
 			subpart_map[i] = subpartidx = relid_subpart_map[partrel->relid] - 1;
@@ -799,6 +799,7 @@ prune_append_rel_partitions(RelOptInfo *rel)
 
 	/* These are not valid when being called from the planner */
 	context.planstate = NULL;
+	context.exprcontext = NULL;
 	context.exprstates = NULL;
 
 	/* Actual pruning happens here. */
@@ -809,8 +810,8 @@ prune_append_rel_partitions(RelOptInfo *rel)
  * get_matching_partitions
  *		Determine partitions that survive partition pruning
  *
- * Note: context->planstate must be set to a valid PlanState when the
- * pruning_steps were generated with a target other than PARTTARGET_PLANNER.
+ * Note: context->exprcontext must be valid when the pruning_steps were
+ * generated with a target other than PARTTARGET_PLANNER.
  *
  * Returns a Bitmapset of the RelOptInfo->part_rels indexes of the surviving
  * partitions.
@@ -1802,12 +1803,13 @@ match_clause_to_partition_key(GeneratePruningStepsContext *context,
 	Oid			partopfamily = part_scheme->partopfamily[partkeyidx],
 				partcoll = part_scheme->partcollation[partkeyidx];
 	Expr	   *expr;
+	bool		noteq;
 
 	/*
 	 * Recognize specially shaped clauses that match a Boolean partition key.
 	 */
 	boolmatchstatus = match_boolean_partition_clause(partopfamily, clause,
-													 partkey, &expr);
+													 partkey, &expr, &noteq);
 
 	if (boolmatchstatus == PARTCLAUSE_MATCH_CLAUSE)
 	{
@@ -1817,7 +1819,7 @@ match_clause_to_partition_key(GeneratePruningStepsContext *context,
 		partclause->keyno = partkeyidx;
 		/* Do pruning with the Boolean equality operator. */
 		partclause->opno = BooleanEqualOperator;
-		partclause->op_is_ne = false;
+		partclause->op_is_ne = noteq;
 		partclause->expr = expr;
 		/* We know that expr is of Boolean type. */
 		partclause->cmpfn = part_scheme->partsupfunc[partkeyidx].fn_oid;
@@ -2289,11 +2291,10 @@ match_clause_to_partition_key(GeneratePruningStepsContext *context,
 		elem_clauses = NIL;
 		foreach(lc1, elem_exprs)
 		{
-			Expr	   *rightop = (Expr *) lfirst(lc1),
-					   *elem_clause;
+			Expr	   *elem_clause;
 
 			elem_clause = make_opclause(saop_op, BOOLOID, false,
-										leftop, rightop,
+										leftop, lfirst(lc1),
 										InvalidOid, saop_coll);
 			elem_clauses = lappend(elem_clauses, elem_clause);
 		}
@@ -2383,7 +2384,7 @@ get_steps_using_prefix(GeneratePruningStepsContext *context,
 		   context->rel->part_scheme->strategy == PARTITION_STRATEGY_HASH);
 
 	/* Quick exit if there are no values to prefix with. */
-	if (list_length(prefix) == 0)
+	if (prefix == NIL)
 	{
 		PartitionPruneStep *step;
 
@@ -3581,22 +3582,28 @@ perform_pruning_combine_step(PartitionPruneContext *context,
  * match_boolean_partition_clause
  *
  * If we're able to match the clause to the partition key as specially-shaped
- * boolean clause, set *outconst to a Const containing a true or false value
- * and return PARTCLAUSE_MATCH_CLAUSE.  Returns PARTCLAUSE_UNSUPPORTED if the
- * clause is not a boolean clause or if the boolean clause is unsuitable for
- * partition pruning.  Returns PARTCLAUSE_NOMATCH if it's a bool quals but
- * just does not match this partition key.  *outconst is set to NULL in the
- * latter two cases.
+ * boolean clause, set *outconst to a Const containing a true or false value,
+ * set *noteq according to if the clause was in the "not" form, i.e. "is not
+ * true" or "is not false", and return PARTCLAUSE_MATCH_CLAUSE.  Returns
+ * PARTCLAUSE_UNSUPPORTED if the clause is not a boolean clause or if the
+ * boolean clause is unsuitable for partition pruning.  Returns
+ * PARTCLAUSE_NOMATCH if it's a bool quals but just does not match this
+ * partition key.  *outconst is set to NULL in the latter two cases.
  */
 static PartClauseMatchStatus
 match_boolean_partition_clause(Oid partopfamily, Expr *clause, Expr *partkey,
-							   Expr **outconst)
+							   Expr **outconst, bool *noteq)
 {
 	Expr	   *leftop;
 
 	*outconst = NULL;
+	*noteq = false;
 
-	if (!IsBooleanOpfamily(partopfamily))
+	/*
+	 * Partitioning currently can only use built-in AMs, so checking for
+	 * built-in boolean opfamilies is good enough.
+	 */
+	if (!IsBuiltinBooleanOpfamily(partopfamily))
 		return PARTCLAUSE_UNSUPPORTED;
 
 	if (IsA(clause, BooleanTest))
@@ -3613,11 +3620,25 @@ match_boolean_partition_clause(Oid partopfamily, Expr *clause, Expr *partkey,
 			leftop = ((RelabelType *) leftop)->arg;
 
 		if (equal(leftop, partkey))
-			*outconst = (btest->booltesttype == IS_TRUE ||
-						 btest->booltesttype == IS_NOT_FALSE)
-				? (Expr *) makeBoolConst(true, false)
-				: (Expr *) makeBoolConst(false, false);
-
+		{
+			switch (btest->booltesttype)
+			{
+				case IS_NOT_TRUE:
+					*noteq = true;
+					/* fall through */
+				case IS_TRUE:
+					*outconst = (Expr *) makeBoolConst(true, false);
+					break;
+				case IS_NOT_FALSE:
+					*noteq = true;
+					/* fall through */
+				case IS_FALSE:
+					*outconst = (Expr *) makeBoolConst(false, false);
+					break;
+				default:
+					return PARTCLAUSE_UNSUPPORTED;
+			}
+		}
 		if (*outconst)
 			return PARTCLAUSE_MATCH_CLAUSE;
 	}
@@ -3632,11 +3653,9 @@ match_boolean_partition_clause(Oid partopfamily, Expr *clause, Expr *partkey,
 
 		/* Compare to the partition key, and make up a clause ... */
 		if (equal(leftop, partkey))
-			*outconst = is_not_clause ?
-				(Expr *) makeBoolConst(false, false) :
-				(Expr *) makeBoolConst(true, false);
+			*outconst = (Expr *) makeBoolConst(!is_not_clause, false);
 		else if (equal(negate_clause((Node *) leftop), partkey))
-			*outconst = (Expr *) makeBoolConst(false, false);
+			*outconst = (Expr *) makeBoolConst(is_not_clause, false);
 
 		if (*outconst)
 			return PARTCLAUSE_MATCH_CLAUSE;
@@ -3655,9 +3674,9 @@ match_boolean_partition_clause(Oid partopfamily, Expr *clause, Expr *partkey,
  * exprstate array.
  *
  * Note that the evaluated result may be in the per-tuple memory context of
- * context->planstate->ps_ExprContext, and we may have leaked other memory
- * there too.  This memory must be recovered by resetting that ExprContext
- * after we're done with the pruning operation (see execPartition.c).
+ * context->exprcontext, and we may have leaked other memory there too.
+ * This memory must be recovered by resetting that ExprContext after
+ * we're done with the pruning operation (see execPartition.c).
  */
 static void
 partkey_datum_from_expr(PartitionPruneContext *context,
@@ -3678,13 +3697,18 @@ partkey_datum_from_expr(PartitionPruneContext *context,
 		ExprContext *ectx;
 
 		/*
-		 * We should never see a non-Const in a step unless we're running in
-		 * the executor.
+		 * We should never see a non-Const in a step unless the caller has
+		 * passed a valid ExprContext.
+		 *
+		 * When context->planstate is valid, context->exprcontext is same as
+		 * context->planstate->ps_ExprContext.
 		 */
-		Assert(context->planstate != NULL);
+		Assert(context->planstate != NULL || context->exprcontext != NULL);
+		Assert(context->planstate == NULL ||
+			   (context->exprcontext == context->planstate->ps_ExprContext));
 
 		exprstate = context->exprstates[stateidx];
-		ectx = context->planstate->ps_ExprContext;
+		ectx = context->exprcontext;
 		*value = ExecEvalExprSwitchContext(exprstate, ectx, isnull);
 	}
 }

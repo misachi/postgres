@@ -3,7 +3,7 @@
  * pl_funcs.c		- Misc functions for the PL/pgSQL
  *			  procedural language
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -288,8 +288,6 @@ plpgsql_stmt_typename(PLpgSQL_stmt *stmt)
 			return "COMMIT";
 		case PLPGSQL_STMT_ROLLBACK:
 			return "ROLLBACK";
-		case PLPGSQL_STMT_SET:
-			return "SET";
 	}
 
 	return "unknown";
@@ -305,6 +303,8 @@ plpgsql_getdiag_kindname(PLpgSQL_getdiag_kind kind)
 	{
 		case PLPGSQL_GETDIAG_ROW_COUNT:
 			return "ROW_COUNT";
+		case PLPGSQL_GETDIAG_ROUTINE_OID:
+			return "PG_ROUTINE_OID";
 		case PLPGSQL_GETDIAG_CONTEXT:
 			return "PG_CONTEXT";
 		case PLPGSQL_GETDIAG_ERROR_CONTEXT:
@@ -370,7 +370,6 @@ static void free_perform(PLpgSQL_stmt_perform *stmt);
 static void free_call(PLpgSQL_stmt_call *stmt);
 static void free_commit(PLpgSQL_stmt_commit *stmt);
 static void free_rollback(PLpgSQL_stmt_rollback *stmt);
-static void free_set(PLpgSQL_stmt_set *stmt);
 static void free_expr(PLpgSQL_expr *expr);
 
 
@@ -459,9 +458,6 @@ free_stmt(PLpgSQL_stmt *stmt)
 			break;
 		case PLPGSQL_STMT_ROLLBACK:
 			free_rollback((PLpgSQL_stmt_rollback *) stmt);
-			break;
-		case PLPGSQL_STMT_SET:
-			free_set((PLpgSQL_stmt_set *) stmt);
 			break;
 		default:
 			elog(ERROR, "unrecognized cmd_type: %d", stmt->cmd_type);
@@ -624,12 +620,6 @@ free_commit(PLpgSQL_stmt_commit *stmt)
 static void
 free_rollback(PLpgSQL_stmt_rollback *stmt)
 {
-}
-
-static void
-free_set(PLpgSQL_stmt_set *stmt)
-{
-	free_expr(stmt->expr);
 }
 
 static void
@@ -825,7 +815,6 @@ static void dump_perform(PLpgSQL_stmt_perform *stmt);
 static void dump_call(PLpgSQL_stmt_call *stmt);
 static void dump_commit(PLpgSQL_stmt_commit *stmt);
 static void dump_rollback(PLpgSQL_stmt_rollback *stmt);
-static void dump_set(PLpgSQL_stmt_set *stmt);
 static void dump_expr(PLpgSQL_expr *expr);
 
 
@@ -924,9 +913,6 @@ dump_stmt(PLpgSQL_stmt *stmt)
 			break;
 		case PLPGSQL_STMT_ROLLBACK:
 			dump_rollback((PLpgSQL_stmt_rollback *) stmt);
-			break;
-		case PLPGSQL_STMT_SET:
-			dump_set((PLpgSQL_stmt_set *) stmt);
 			break;
 		default:
 			elog(ERROR, "unrecognized cmd_type: %d", stmt->cmd_type);
@@ -1330,13 +1316,6 @@ dump_rollback(PLpgSQL_stmt_rollback *stmt)
 }
 
 static void
-dump_set(PLpgSQL_stmt_set *stmt)
-{
-	dump_ind();
-	printf("%s\n", stmt->expr->query);
-}
-
-static void
 dump_exit(PLpgSQL_stmt_exit *stmt)
 {
 	dump_ind();
@@ -1670,13 +1649,12 @@ plpgsql_dumptree(PLpgSQL_function *func)
 			case PLPGSQL_DTYPE_ROW:
 				{
 					PLpgSQL_row *row = (PLpgSQL_row *) d;
-					int			i;
 
 					printf("ROW %-16s fields", row->refname);
-					for (i = 0; i < row->nfields; i++)
+					for (int j = 0; j < row->nfields; j++)
 					{
-						printf(" %s=var %d", row->fieldnames[i],
-							   row->varnos[i]);
+						printf(" %s=var %d", row->fieldnames[j],
+							   row->varnos[j]);
 					}
 					printf("\n");
 				}

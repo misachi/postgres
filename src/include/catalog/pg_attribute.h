@@ -8,7 +8,7 @@
  * relations need be included.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_attribute.h
@@ -53,15 +53,6 @@ CATALOG(pg_attribute,1249,AttributeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(75,
 	Oid			atttypid BKI_LOOKUP_OPT(pg_type);
 
 	/*
-	 * attstattarget is the target number of statistics datapoints to collect
-	 * during VACUUM ANALYZE of this column.  A zero here indicates that we do
-	 * not wish to collect any stats about this column. A "-1" here indicates
-	 * that no value has been explicitly set for this column, so ANALYZE
-	 * should use the default setting.
-	 */
-	int32		attstattarget BKI_DEFAULT(-1);
-
-	/*
 	 * attlen is a copy of the typlen field from pg_type for this attribute.
 	 * See atttypid comments above.
 	 */
@@ -83,12 +74,6 @@ CATALOG(pg_attribute,1249,AttributeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(75,
 	int16		attnum;
 
 	/*
-	 * attndims is the declared number of dimensions, if an array type,
-	 * otherwise zero.
-	 */
-	int32		attndims;
-
-	/*
 	 * fastgetattr() uses attcacheoff to cache byte offsets of attributes in
 	 * heap tuples.  The value actually stored in pg_attribute (-1) indicates
 	 * no cached value.  But when we copy these tuples into a tuple
@@ -106,10 +91,22 @@ CATALOG(pg_attribute,1249,AttributeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(75,
 	int32		atttypmod BKI_DEFAULT(-1);
 
 	/*
+	 * attndims is the declared number of dimensions, if an array type,
+	 * otherwise zero.
+	 */
+	int16		attndims;
+
+	/*
 	 * attbyval is a copy of the typbyval field from pg_type for this
 	 * attribute.  See atttypid comments above.
 	 */
 	bool		attbyval;
+
+	/*
+	 * attalign is a copy of the typalign field from pg_type for this
+	 * attribute.  See atttypid comments above.
+	 */
+	char		attalign;
 
 	/*----------
 	 * attstorage tells for VARLENA attributes, what the heap access
@@ -120,10 +117,14 @@ CATALOG(pg_attribute,1249,AttributeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(75,
 	char		attstorage;
 
 	/*
-	 * attalign is a copy of the typalign field from pg_type for this
-	 * attribute.  See atttypid comments above.
+	 * attcompression sets the current compression method of the attribute.
+	 * Typically this is InvalidCompressionMethod ('\0') to specify use of the
+	 * current default setting (see default_toast_compression).  Otherwise,
+	 * 'p' selects pglz compression, while 'l' selects LZ4 compression.
+	 * However, this field is ignored whenever attstorage does not allow
+	 * compression.
 	 */
-	char		attalign;
+	char		attcompression BKI_DEFAULT('\0');
 
 	/* This flag represents the "NOT NULL" constraint */
 	bool		attnotnull;
@@ -155,16 +156,21 @@ CATALOG(pg_attribute,1249,AttributeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(75,
 	bool		attislocal BKI_DEFAULT(t);
 
 	/* Number of times inherited from direct parent relation(s) */
-	int32		attinhcount BKI_DEFAULT(0);
+	int16		attinhcount BKI_DEFAULT(0);
+
+	/*
+	 * attstattarget is the target number of statistics datapoints to collect
+	 * during VACUUM ANALYZE of this column.  A zero here indicates that we do
+	 * not wish to collect any stats about this column. A "-1" here indicates
+	 * that no value has been explicitly set for this column, so ANALYZE
+	 * should use the default setting.
+	 *
+	 * int16 is sufficient for the current max value (MAX_STATISTICS_TARGET).
+	 */
+	int16		attstattarget BKI_DEFAULT(-1);
 
 	/* attribute's collation, if any */
 	Oid			attcollation BKI_LOOKUP_OPT(pg_collation);
-
-	/*
-	 * compression method.  Must be InvalidCompressionMethod if and only if
-	 * typstorage is 'plain' or 'external'.
-	 */
-	char		attcompression BKI_DEFAULT('\0');
 
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	/* NOTE: The following fields are not present in tuple descriptors. */
@@ -190,10 +196,10 @@ CATALOG(pg_attribute,1249,AttributeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(75,
  * ATTRIBUTE_FIXED_PART_SIZE is the size of the fixed-layout,
  * guaranteed-not-null part of a pg_attribute row.  This is in fact as much
  * of the row as gets copied into tuple descriptors, so don't expect you
- * can access fields beyond attcollation except in a real tuple!
+ * can access the variable-length fields except in a real tuple!
  */
 #define ATTRIBUTE_FIXED_PART_SIZE \
-	(offsetof(FormData_pg_attribute,attcompression) + sizeof(char))
+	(offsetof(FormData_pg_attribute,attcollation) + sizeof(Oid))
 
 /* ----------------
  *		Form_pg_attribute corresponds to a pointer to a tuple with
@@ -202,10 +208,8 @@ CATALOG(pg_attribute,1249,AttributeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(75,
  */
 typedef FormData_pg_attribute *Form_pg_attribute;
 
-DECLARE_UNIQUE_INDEX(pg_attribute_relid_attnam_index, 2658, on pg_attribute using btree(attrelid oid_ops, attname name_ops));
-#define AttributeRelidNameIndexId  2658
-DECLARE_UNIQUE_INDEX_PKEY(pg_attribute_relid_attnum_index, 2659, on pg_attribute using btree(attrelid oid_ops, attnum int2_ops));
-#define AttributeRelidNumIndexId  2659
+DECLARE_UNIQUE_INDEX(pg_attribute_relid_attnam_index, 2658, AttributeRelidNameIndexId, pg_attribute, btree(attrelid oid_ops, attname name_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_attribute_relid_attnum_index, 2659, AttributeRelidNumIndexId, pg_attribute, btree(attrelid oid_ops, attnum int2_ops));
 
 #ifdef EXPOSE_TO_CLIENT_CODE
 

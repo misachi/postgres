@@ -1,28 +1,30 @@
 
-# Copyright (c) 2021, PostgreSQL Global Development Group
+# Copyright (c) 2021-2023, PostgreSQL Global Development Group
 
 # Test WAL replay when some operation has skipped WAL.
 #
 # These tests exercise code that once violated the mandate described in
 # src/backend/access/transam/README section "Skipping WAL for New
-# RelFileNode".  The tests work by committing some transactions, initiating an
+# RelFileLocator".  The tests work by committing some transactions, initiating an
 # immediate shutdown, and confirming that the expected data survives recovery.
 # For many years, individual commands made the decision to skip WAL, hence the
 # frequent appearance of COPY in these tests.
 use strict;
 use warnings;
 
-use PostgresNode;
-use TestLib;
-use Test::More tests => 34;
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
 
 sub check_orphan_relfilenodes
 {
+	local $Test::Builder::Level = $Test::Builder::Level + 1;
+
 	my ($node, $test_name) = @_;
 
 	my $db_oid = $node->safe_psql('postgres',
 		"SELECT oid FROM pg_database WHERE datname = 'postgres'");
-	my $prefix               = "base/$db_oid/";
+	my $prefix = "base/$db_oid/";
 	my $filepaths_referenced = $node->safe_psql(
 		'postgres', "
 	   SELECT pg_relation_filepath(oid) FROM pg_class
@@ -43,7 +45,7 @@ sub run_wal_optimize
 {
 	my $wal_level = shift;
 
-	my $node = get_new_node("node_$wal_level");
+	my $node = PostgreSQL::Test::Cluster->new("node_$wal_level");
 	$node->init;
 	$node->append_conf(
 		'postgresql.conf', qq(
@@ -58,9 +60,31 @@ wal_skip_threshold = 0
 	# Setup
 	my $tablespace_dir = $node->basedir . '/tablespace_other';
 	mkdir($tablespace_dir);
-	$tablespace_dir = TestLib::perl2host($tablespace_dir);
-	$node->safe_psql('postgres',
-		"CREATE TABLESPACE other LOCATION '$tablespace_dir';");
+	my $result;
+
+	# Test redo of CREATE TABLESPACE.
+	$node->safe_psql(
+		'postgres', "
+		CREATE TABLE moved (id int);
+		INSERT INTO moved VALUES (1);
+		CREATE TABLESPACE other LOCATION '$tablespace_dir';
+		BEGIN;
+		ALTER TABLE moved SET TABLESPACE other;
+		CREATE TABLE originated (id int);
+		INSERT INTO originated VALUES (1);
+		CREATE UNIQUE INDEX ON originated(id) TABLESPACE other;
+		COMMIT;");
+	$node->stop('immediate');
+	$node->start;
+	$result = $node->safe_psql('postgres', "SELECT count(*) FROM moved;");
+	is($result, qq(1), "wal_level = $wal_level, CREATE+SET TABLESPACE");
+	$result = $node->safe_psql(
+		'postgres', "
+		INSERT INTO originated VALUES (1) ON CONFLICT (id)
+		  DO UPDATE set id = originated.id + 1
+		  RETURNING id;");
+	is($result, qq(2),
+		"wal_level = $wal_level, CREATE TABLESPACE, CREATE INDEX");
 
 	# Test direct truncation optimization.  No tuples.
 	$node->safe_psql(
@@ -71,7 +95,7 @@ wal_skip_threshold = 0
 		COMMIT;");
 	$node->stop('immediate');
 	$node->start;
-	my $result = $node->safe_psql('postgres', "SELECT count(*) FROM trunc;");
+	$result = $node->safe_psql('postgres', "SELECT count(*) FROM trunc;");
 	is($result, qq(0), "wal_level = $wal_level, TRUNCATE with empty table");
 
 	# Test truncation with inserted tuples within the same transaction.
@@ -121,13 +145,12 @@ wal_skip_threshold = 0
 	is($result, qq(20000), "wal_level = $wal_level, end-of-xact WAL");
 
 	# Data file for COPY query in subsequent tests
-	my $basedir   = $node->basedir;
+	my $basedir = $node->basedir;
 	my $copy_file = "$basedir/copy_data.txt";
-	TestLib::append_to_file(
+	PostgreSQL::Test::Utils::append_to_file(
 		$copy_file, qq(20000,30000
 20001,30001
 20002,30002));
-	$copy_file = TestLib::perl2host($copy_file);
 
 	# Test truncation with inserted tuples using both INSERT and COPY.  Tuples
 	# inserted after the truncation should be seen.
@@ -374,3 +397,5 @@ wal_skip_threshold = 0
 # Run same test suite for multiple wal_level values.
 run_wal_optimize("minimal");
 run_wal_optimize("replica");
+
+done_testing();

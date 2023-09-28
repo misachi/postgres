@@ -2,7 +2,7 @@
  *
  * pg_dumpall.c
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * pg_dumpall forces all pg_dump output to be text, since it also outputs
@@ -18,8 +18,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "catalog/pg_authid_d.h"
 #include "common/connect.h"
 #include "common/file_utils.h"
+#include "common/hashfn.h"
 #include "common/logging.h"
 #include "common/string.h"
 #include "dumputils.h"
@@ -30,13 +32,35 @@
 /* version string we expect back from pg_dump */
 #define PGDUMP_VERSIONSTR "pg_dump (PostgreSQL) " PG_VERSION "\n"
 
+static uint32 hash_string_pointer(char *s);
+
+typedef struct
+{
+	uint32		status;
+	uint32		hashval;
+	char	   *rolename;
+} RoleNameEntry;
+
+#define SH_PREFIX	rolename
+#define SH_ELEMENT_TYPE	RoleNameEntry
+#define SH_KEY_TYPE	char *
+#define SH_KEY		rolename
+#define SH_HASH_KEY(tb, key)	hash_string_pointer(key)
+#define SH_EQUAL(tb, a, b)		(strcmp(a, b) == 0)
+#define SH_STORE_HASH
+#define SH_GET_HASH(tb, a)		(a)->hashval
+#define SH_SCOPE	static inline
+#define SH_RAW_ALLOCATOR	pg_malloc0
+#define SH_DECLARE
+#define SH_DEFINE
+#include "lib/simplehash.h"
 
 static void help(void);
 
 static void dropRoles(PGconn *conn);
 static void dumpRoles(PGconn *conn);
 static void dumpRoleMembership(PGconn *conn);
-static void dumpGroups(PGconn *conn);
+static void dumpRoleGUCPrivs(PGconn *conn);
 static void dropTablespaces(PGconn *conn);
 static void dumpTablespaces(PGconn *conn);
 static void dropDBs(PGconn *conn);
@@ -48,8 +72,10 @@ static void buildShSecLabels(PGconn *conn,
 							 const char *catalog_name, Oid objectId,
 							 const char *objtype, const char *objname,
 							 PQExpBuffer buffer);
-static PGconn *connectDatabase(const char *dbname, const char *connstr, const char *pghost, const char *pgport,
-							   const char *pguser, trivalue prompt_password, bool fail_on_error);
+static PGconn *connectDatabase(const char *dbname,
+							   const char *connection_string, const char *pghost,
+							   const char *pgport, const char *pguser,
+							   trivalue prompt_password, bool fail_on_error);
 static char *constructConnStr(const char **keywords, const char **values);
 static PGresult *executeQuery(PGconn *conn, const char *query);
 static void executeCommand(PGconn *conn, const char *query);
@@ -71,12 +97,14 @@ static int	disable_dollar_quoting = 0;
 static int	disable_triggers = 0;
 static int	if_exists = 0;
 static int	inserts = 0;
+static int	no_table_access_method = 0;
 static int	no_tablespaces = 0;
 static int	use_setsessauth = 0;
 static int	no_comments = 0;
 static int	no_publications = 0;
 static int	no_security_labels = 0;
 static int	no_subscriptions = 0;
+static int	no_toast_compression = 0;
 static int	no_unlogged_table_data = 0;
 static int	no_role_passwords = 0;
 static int	server_version;
@@ -133,6 +161,7 @@ main(int argc, char *argv[])
 		{"if-exists", no_argument, &if_exists, 1},
 		{"inserts", no_argument, &inserts, 1},
 		{"lock-wait-timeout", required_argument, NULL, 2},
+		{"no-table-access-method", no_argument, &no_table_access_method, 1},
 		{"no-tablespaces", no_argument, &no_tablespaces, 1},
 		{"quote-all-identifiers", no_argument, &quote_all_identifiers, 1},
 		{"load-via-partition-root", no_argument, &load_via_partition_root, 1},
@@ -144,6 +173,7 @@ main(int argc, char *argv[])
 		{"no-security-labels", no_argument, &no_security_labels, 1},
 		{"no-subscriptions", no_argument, &no_subscriptions, 1},
 		{"no-sync", no_argument, NULL, 4},
+		{"no-toast-compression", no_argument, &no_toast_compression, 1},
 		{"no-unlogged-table-data", no_argument, &no_unlogged_table_data, 1},
 		{"on-conflict-do-nothing", no_argument, &on_conflict_do_nothing, 1},
 		{"rows-per-insert", required_argument, NULL, 7},
@@ -197,16 +227,11 @@ main(int argc, char *argv[])
 			strlcpy(full_path, progname, sizeof(full_path));
 
 		if (ret == -1)
-			pg_log_error("The program \"%s\" is needed by %s but was not found in the\n"
-						 "same directory as \"%s\".\n"
-						 "Check your installation.",
-						 "pg_dump", progname, full_path);
+			pg_fatal("program \"%s\" is needed by %s but was not found in the same directory as \"%s\"",
+					 "pg_dump", progname, full_path);
 		else
-			pg_log_error("The program \"%s\" was found by \"%s\"\n"
-						 "but was not the same version as %s.\n"
-						 "Check your installation.",
-						 "pg_dump", full_path, progname);
-		exit_nicely(1);
+			pg_fatal("program \"%s\" was found by \"%s\" but was not the same version as %s",
+					 "pg_dump", full_path, progname);
 	}
 
 	pgdumpopts = createPQExpBuffer();
@@ -336,7 +361,8 @@ main(int argc, char *argv[])
 				break;
 
 			default:
-				fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+				/* getopt_long already emitted a complaint */
+				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 				exit_nicely(1);
 		}
 	}
@@ -346,8 +372,7 @@ main(int argc, char *argv[])
 	{
 		pg_log_error("too many command-line arguments (first is \"%s\")",
 					 argv[optind]);
-		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-				progname);
+		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit_nicely(1);
 	}
 
@@ -355,8 +380,7 @@ main(int argc, char *argv[])
 		(globals_only || roles_only || tablespaces_only))
 	{
 		pg_log_error("option --exclude-database cannot be used together with -g/--globals-only, -r/--roles-only, or -t/--tablespaces-only");
-		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-				progname);
+		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit_nicely(1);
 	}
 
@@ -364,30 +388,24 @@ main(int argc, char *argv[])
 	if (globals_only && roles_only)
 	{
 		pg_log_error("options -g/--globals-only and -r/--roles-only cannot be used together");
-		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-				progname);
+		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit_nicely(1);
 	}
 
 	if (globals_only && tablespaces_only)
 	{
 		pg_log_error("options -g/--globals-only and -t/--tablespaces-only cannot be used together");
-		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-				progname);
+		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit_nicely(1);
 	}
 
 	if (if_exists && !output_clean)
-	{
-		pg_log_error("option --if-exists requires option -c/--clean");
-		exit_nicely(1);
-	}
+		pg_fatal("option --if-exists requires option -c/--clean");
 
 	if (roles_only && tablespaces_only)
 	{
 		pg_log_error("options -r/--roles-only and -t/--tablespaces-only cannot be used together");
-		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-				progname);
+		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit_nicely(1);
 	}
 
@@ -412,6 +430,8 @@ main(int argc, char *argv[])
 		appendPQExpBufferStr(pgdumpopts, " --disable-triggers");
 	if (inserts)
 		appendPQExpBufferStr(pgdumpopts, " --inserts");
+	if (no_table_access_method)
+		appendPQExpBufferStr(pgdumpopts, " --no-table-access-method");
 	if (no_tablespaces)
 		appendPQExpBufferStr(pgdumpopts, " --no-tablespaces");
 	if (quote_all_identifiers)
@@ -428,6 +448,8 @@ main(int argc, char *argv[])
 		appendPQExpBufferStr(pgdumpopts, " --no-security-labels");
 	if (no_subscriptions)
 		appendPQExpBufferStr(pgdumpopts, " --no-subscriptions");
+	if (no_toast_compression)
+		appendPQExpBufferStr(pgdumpopts, " --no-toast-compression");
 	if (no_unlogged_table_data)
 		appendPQExpBufferStr(pgdumpopts, " --no-unlogged-table-data");
 	if (on_conflict_do_nothing)
@@ -436,8 +458,7 @@ main(int argc, char *argv[])
 	/*
 	 * If there was a database specified on the command line, use that,
 	 * otherwise try to connect to database "postgres", and failing that
-	 * "template1".  "postgres" is the preferred choice for 8.1 and later
-	 * servers, but it usually will not exist on older ones.
+	 * "template1".
 	 */
 	if (pgdb)
 	{
@@ -445,10 +466,7 @@ main(int argc, char *argv[])
 							   prompt_password, false);
 
 		if (!conn)
-		{
-			pg_log_error("could not connect to database \"%s\"", pgdb);
-			exit_nicely(1);
-		}
+			pg_fatal("could not connect to database \"%s\"", pgdb);
 	}
 	else
 	{
@@ -462,8 +480,7 @@ main(int argc, char *argv[])
 		{
 			pg_log_error("could not connect to databases \"postgres\" or \"template1\"\n"
 						 "Please specify an alternative database.");
-			fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-					progname);
+			pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 			exit_nicely(1);
 		}
 	}
@@ -481,11 +498,8 @@ main(int argc, char *argv[])
 	{
 		OPF = fopen(filename, PG_BINARY_W);
 		if (!OPF)
-		{
-			pg_log_error("could not open output file \"%s\": %m",
-						 filename);
-			exit_nicely(1);
-		}
+			pg_fatal("could not open output file \"%s\": %m",
+					 filename);
 	}
 	else
 		OPF = stdout;
@@ -496,11 +510,8 @@ main(int argc, char *argv[])
 	if (dumpencoding)
 	{
 		if (PQsetClientEncoding(conn, dumpencoding) < 0)
-		{
-			pg_log_error("invalid client encoding \"%s\" specified",
-						 dumpencoding);
-			exit_nicely(1);
-		}
+			pg_fatal("invalid client encoding \"%s\" specified",
+					 dumpencoding);
 	}
 
 	/*
@@ -513,7 +524,7 @@ main(int argc, char *argv[])
 		std_strings = "off";
 
 	/* Set the role if requested */
-	if (use_role && server_version >= 80100)
+	if (use_role)
 	{
 		PQExpBuffer query = createPQExpBuffer();
 
@@ -523,7 +534,7 @@ main(int argc, char *argv[])
 	}
 
 	/* Force quoting of all identifiers if requested. */
-	if (quote_all_identifiers && server_version >= 90100)
+	if (quote_all_identifiers)
 		executeCommand(conn, "SET quote_all_identifiers = true");
 
 	fprintf(OPF, "--\n-- PostgreSQL database cluster dump\n--\n\n");
@@ -577,11 +588,12 @@ main(int argc, char *argv[])
 			/* Dump roles (users) */
 			dumpRoles(conn);
 
-			/* Dump role memberships --- need different method for pre-8.1 */
-			if (server_version >= 80100)
-				dumpRoleMembership(conn);
-			else
-				dumpGroups(conn);
+			/* Dump role memberships */
+			dumpRoleMembership(conn);
+
+			/* Dump role GUC privileges */
+			if (server_version >= 150000 && !skip_acls)
+				dumpRoleGUCPrivs(conn);
 		}
 
 		/* Dump tablespaces */
@@ -650,7 +662,9 @@ help(void)
 	printf(_("  --no-security-labels         do not dump security label assignments\n"));
 	printf(_("  --no-subscriptions           do not dump subscriptions\n"));
 	printf(_("  --no-sync                    do not wait for changes to be written safely to disk\n"));
+	printf(_("  --no-table-access-method     do not dump table access methods\n"));
 	printf(_("  --no-tablespaces             do not dump tablespace assignments\n"));
+	printf(_("  --no-toast-compression       do not dump TOAST compression methods\n"));
 	printf(_("  --no-unlogged-table-data     do not dump unlogged table data\n"));
 	printf(_("  --on-conflict-do-nothing     add ON CONFLICT DO NOTHING to INSERT commands\n"));
 	printf(_("  --quote-all-identifiers      quote all identifiers, even if not key words\n"));
@@ -693,19 +707,11 @@ dropRoles(PGconn *conn)
 						  "FROM %s "
 						  "WHERE rolname !~ '^pg_' "
 						  "ORDER BY 1", role_catalog);
-	else if (server_version >= 80100)
+	else
 		printfPQExpBuffer(buf,
 						  "SELECT rolname "
 						  "FROM %s "
 						  "ORDER BY 1", role_catalog);
-	else
-		printfPQExpBuffer(buf,
-						  "SELECT usename as rolname "
-						  "FROM pg_shadow "
-						  "UNION "
-						  "SELECT groname as rolname "
-						  "FROM pg_group "
-						  "ORDER BY 1");
 
 	res = executeQuery(conn, buf->data);
 
@@ -777,7 +783,7 @@ dumpRoles(PGconn *conn)
 						  "rolname = current_user AS is_current_user "
 						  "FROM %s "
 						  "ORDER BY 2", role_catalog, role_catalog);
-	else if (server_version >= 90100)
+	else
 		printfPQExpBuffer(buf,
 						  "SELECT oid, rolname, rolsuper, rolinherit, "
 						  "rolcreaterole, rolcreatedb, "
@@ -788,62 +794,6 @@ dumpRoles(PGconn *conn)
 						  "rolname = current_user AS is_current_user "
 						  "FROM %s "
 						  "ORDER BY 2", role_catalog, role_catalog);
-	else if (server_version >= 80200)
-		printfPQExpBuffer(buf,
-						  "SELECT oid, rolname, rolsuper, rolinherit, "
-						  "rolcreaterole, rolcreatedb, "
-						  "rolcanlogin, rolconnlimit, rolpassword, "
-						  "rolvaliduntil, false as rolreplication, "
-						  "false as rolbypassrls, "
-						  "pg_catalog.shobj_description(oid, '%s') as rolcomment, "
-						  "rolname = current_user AS is_current_user "
-						  "FROM %s "
-						  "ORDER BY 2", role_catalog, role_catalog);
-	else if (server_version >= 80100)
-		printfPQExpBuffer(buf,
-						  "SELECT oid, rolname, rolsuper, rolinherit, "
-						  "rolcreaterole, rolcreatedb, "
-						  "rolcanlogin, rolconnlimit, rolpassword, "
-						  "rolvaliduntil, false as rolreplication, "
-						  "false as rolbypassrls, "
-						  "null as rolcomment, "
-						  "rolname = current_user AS is_current_user "
-						  "FROM %s "
-						  "ORDER BY 2", role_catalog);
-	else
-		printfPQExpBuffer(buf,
-						  "SELECT 0 as oid, usename as rolname, "
-						  "usesuper as rolsuper, "
-						  "true as rolinherit, "
-						  "usesuper as rolcreaterole, "
-						  "usecreatedb as rolcreatedb, "
-						  "true as rolcanlogin, "
-						  "-1 as rolconnlimit, "
-						  "passwd as rolpassword, "
-						  "valuntil as rolvaliduntil, "
-						  "false as rolreplication, "
-						  "false as rolbypassrls, "
-						  "null as rolcomment, "
-						  "usename = current_user AS is_current_user "
-						  "FROM pg_shadow "
-						  "UNION ALL "
-						  "SELECT 0 as oid, groname as rolname, "
-						  "false as rolsuper, "
-						  "true as rolinherit, "
-						  "false as rolcreaterole, "
-						  "false as rolcreatedb, "
-						  "false as rolcanlogin, "
-						  "-1 as rolconnlimit, "
-						  "null::text as rolpassword, "
-						  "null::timestamptz as rolvaliduntil, "
-						  "false as rolreplication, "
-						  "false as rolbypassrls, "
-						  "null as rolcomment, "
-						  "false AS is_current_user "
-						  "FROM pg_group "
-						  "WHERE NOT EXISTS (SELECT 1 FROM pg_shadow "
-						  " WHERE usename = groname) "
-						  "ORDER BY 2");
 
 	res = executeQuery(conn, buf->data);
 
@@ -962,7 +912,7 @@ dumpRoles(PGconn *conn)
 			appendPQExpBufferStr(buf, ";\n");
 		}
 
-		if (!no_security_labels && server_version >= 90200)
+		if (!no_security_labels)
 			buildShSecLabels(conn, "pg_authid", auth_oid,
 							 "ROLE", rolename,
 							 buf);
@@ -975,6 +925,9 @@ dumpRoles(PGconn *conn)
 	 * We do it this way because config settings for roles could mention the
 	 * names of other roles.
 	 */
+	if (PQntuples(res) > 0)
+		fprintf(OPF, "\n--\n-- User Configurations\n--\n");
+
 	for (i = 0; i < PQntuples(res); i++)
 		dumpUserConfig(conn, PQgetvalue(res, i, i_rolname));
 
@@ -987,7 +940,7 @@ dumpRoles(PGconn *conn)
 
 
 /*
- * Dump role memberships.  This code is used for 8.1 and later servers.
+ * Dump role memberships.
  *
  * Note: we expect dumpRoles already created all the roles, but there is
  * no membership yet.
@@ -996,46 +949,188 @@ static void
 dumpRoleMembership(PGconn *conn)
 {
 	PQExpBuffer buf = createPQExpBuffer();
+	PQExpBuffer optbuf = createPQExpBuffer();
 	PGresult   *res;
-	int			i;
+	int			start = 0,
+				end,
+				total;
+	bool		dump_grantors;
+	bool		dump_grant_options;
+	int			i_inherit_option;
+	int			i_set_option;
 
-	printfPQExpBuffer(buf, "SELECT ur.rolname AS roleid, "
+	/*
+	 * Previous versions of PostgreSQL didn't used to track the grantor very
+	 * carefully in the backend, and the grantor could be any user even if
+	 * they didn't have ADMIN OPTION on the role, or a user that no longer
+	 * existed. To avoid dump and restore failures, don't dump the grantor
+	 * when talking to an old server version.
+	 */
+	dump_grantors = (PQserverVersion(conn) >= 160000);
+
+	/*
+	 * Previous versions of PostgreSQL also did not have grant-level options.
+	 */
+	dump_grant_options = (server_version >= 160000);
+
+	/* Generate and execute query. */
+	printfPQExpBuffer(buf, "SELECT ur.rolname AS role, "
 					  "um.rolname AS member, "
-					  "a.admin_option, "
-					  "ug.rolname AS grantor "
-					  "FROM pg_auth_members a "
+					  "ug.oid AS grantorid, "
+					  "ug.rolname AS grantor, "
+					  "a.admin_option");
+	if (dump_grant_options)
+		appendPQExpBufferStr(buf, ", a.inherit_option, a.set_option");
+	appendPQExpBuffer(buf, " FROM pg_auth_members a "
 					  "LEFT JOIN %s ur on ur.oid = a.roleid "
 					  "LEFT JOIN %s um on um.oid = a.member "
 					  "LEFT JOIN %s ug on ug.oid = a.grantor "
 					  "WHERE NOT (ur.rolname ~ '^pg_' AND um.rolname ~ '^pg_')"
-					  "ORDER BY 1,2,3", role_catalog, role_catalog, role_catalog);
+					  "ORDER BY 1,2,4", role_catalog, role_catalog, role_catalog);
 	res = executeQuery(conn, buf->data);
+	i_inherit_option = PQfnumber(res, "inherit_option");
+	i_set_option = PQfnumber(res, "set_option");
 
 	if (PQntuples(res) > 0)
 		fprintf(OPF, "--\n-- Role memberships\n--\n\n");
 
-	for (i = 0; i < PQntuples(res); i++)
+	/*
+	 * We can't dump these GRANT commands in arbitrary order, because a role
+	 * that is named as a grantor must already have ADMIN OPTION on the role
+	 * for which it is granting permissions, except for the bootstrap
+	 * superuser, who can always be named as the grantor.
+	 *
+	 * We handle this by considering these grants role by role. For each role,
+	 * we initially consider the only allowable grantor to be the bootstrap
+	 * superuser. Every time we grant ADMIN OPTION on the role to some user,
+	 * that user also becomes an allowable grantor. We make repeated passes
+	 * over the grants for the role, each time dumping those whose grantors
+	 * are allowable and which we haven't done yet. Eventually this should let
+	 * us dump all the grants.
+	 */
+	total = PQntuples(res);
+	while (start < total)
 	{
-		char	   *roleid = PQgetvalue(res, i, 0);
-		char	   *member = PQgetvalue(res, i, 1);
-		char	   *option = PQgetvalue(res, i, 2);
+		char	   *role = PQgetvalue(res, start, 0);
+		int			i;
+		bool	   *done;
+		int			remaining;
+		int			prev_remaining = 0;
+		rolename_hash *ht;
 
-		fprintf(OPF, "GRANT %s", fmtId(roleid));
-		fprintf(OPF, " TO %s", fmtId(member));
-		if (*option == 't')
-			fprintf(OPF, " WITH ADMIN OPTION");
+		/* All memberships for a single role should be adjacent. */
+		for (end = start; end < total; ++end)
+		{
+			char	   *otherrole;
+
+			otherrole = PQgetvalue(res, end, 0);
+			if (strcmp(role, otherrole) != 0)
+				break;
+		}
+
+		role = PQgetvalue(res, start, 0);
+		remaining = end - start;
+		done = pg_malloc0(remaining * sizeof(bool));
+		ht = rolename_create(remaining, NULL);
 
 		/*
-		 * We don't track the grantor very carefully in the backend, so cope
-		 * with the possibility that it has been dropped.
+		 * Make repeated passes over the grants for this role until all have
+		 * been dumped.
 		 */
-		if (!PQgetisnull(res, i, 3))
+		while (remaining > 0)
 		{
-			char	   *grantor = PQgetvalue(res, i, 3);
+			/*
+			 * We should make progress on every iteration, because a notional
+			 * graph whose vertices are grants and whose edges point from
+			 * grantors to members should be connected and acyclic. If we fail
+			 * to make progress, either we or the server have messed up.
+			 */
+			if (remaining == prev_remaining)
+			{
+				pg_log_error("could not find a legal dump ordering for memberships in role \"%s\"",
+							 role);
+				PQfinish(conn);
+				exit_nicely(1);
+			}
+			prev_remaining = remaining;
 
-			fprintf(OPF, " GRANTED BY %s", fmtId(grantor));
+			/* Make one pass over the grants for this role. */
+			for (i = start; i < end; ++i)
+			{
+				char	   *member;
+				char	   *admin_option;
+				char	   *grantorid;
+				char	   *grantor;
+				char	   *set_option = "true";
+				bool		found;
+
+				/* If we already did this grant, don't do it again. */
+				if (done[i - start])
+					continue;
+
+				member = PQgetvalue(res, i, 1);
+				grantorid = PQgetvalue(res, i, 2);
+				grantor = PQgetvalue(res, i, 3);
+				admin_option = PQgetvalue(res, i, 4);
+				if (dump_grant_options)
+					set_option = PQgetvalue(res, i, i_set_option);
+
+				/*
+				 * If we're not dumping grantors or if the grantor is the
+				 * bootstrap superuser, it's fine to dump this now. Otherwise,
+				 * it's got to be someone who has already been granted ADMIN
+				 * OPTION.
+				 */
+				if (dump_grantors &&
+					atooid(grantorid) != BOOTSTRAP_SUPERUSERID &&
+					rolename_lookup(ht, grantor) == NULL)
+					continue;
+
+				/* Remember that we did this so that we don't do it again. */
+				done[i - start] = true;
+				--remaining;
+
+				/*
+				 * If ADMIN OPTION is being granted, remember that grants
+				 * listing this member as the grantor can now be dumped.
+				 */
+				if (*admin_option == 't')
+					rolename_insert(ht, member, &found);
+
+				/* Generate the actual GRANT statement. */
+				resetPQExpBuffer(optbuf);
+				fprintf(OPF, "GRANT %s", fmtId(role));
+				fprintf(OPF, " TO %s", fmtId(member));
+				if (*admin_option == 't')
+					appendPQExpBufferStr(optbuf, "ADMIN OPTION");
+				if (dump_grant_options)
+				{
+					char	   *inherit_option;
+
+					if (optbuf->data[0] != '\0')
+						appendPQExpBufferStr(optbuf, ", ");
+					inherit_option = PQgetvalue(res, i, i_inherit_option);
+					appendPQExpBuffer(optbuf, "INHERIT %s",
+									  *inherit_option == 't' ?
+									  "TRUE" : "FALSE");
+				}
+				if (*set_option != 't')
+				{
+					if (optbuf->data[0] != '\0')
+						appendPQExpBufferStr(optbuf, ", ");
+					appendPQExpBuffer(optbuf, "SET FALSE");
+				}
+				if (optbuf->data[0] != '\0')
+					fprintf(OPF, " WITH %s", optbuf->data);
+				if (dump_grantors)
+					fprintf(OPF, " GRANTED BY %s", fmtId(grantor));
+				fprintf(OPF, ";\n");
+			}
 		}
-		fprintf(OPF, ";\n");
+
+		rolename_destroy(ht);
+		pg_free(done);
+		start = end;
 	}
 
 	PQclear(res);
@@ -1044,72 +1139,62 @@ dumpRoleMembership(PGconn *conn)
 	fprintf(OPF, "\n\n");
 }
 
+
 /*
- * Dump group memberships from a pre-8.1 server.  It's annoying that we
- * can't share any useful amount of code with the post-8.1 case, but
- * the catalog representations are too different.
+ * Dump role configuration parameter privileges.  This code is used for 15.0
+ * and later servers.
  *
- * Note: we expect dumpRoles already created all the roles, but there is
- * no membership yet.
+ * Note: we expect dumpRoles already created all the roles, but there are
+ * no per-role configuration parameter privileges yet.
  */
 static void
-dumpGroups(PGconn *conn)
+dumpRoleGUCPrivs(PGconn *conn)
 {
-	PQExpBuffer buf = createPQExpBuffer();
 	PGresult   *res;
 	int			i;
 
-	res = executeQuery(conn,
-					   "SELECT groname, grolist FROM pg_group ORDER BY 1");
+	/*
+	 * Get all parameters that have non-default acls defined.
+	 */
+	res = executeQuery(conn, "SELECT parname, "
+					   "pg_catalog.pg_get_userbyid(" CppAsString2(BOOTSTRAP_SUPERUSERID) ") AS parowner, "
+					   "paracl, "
+					   "pg_catalog.acldefault('p', " CppAsString2(BOOTSTRAP_SUPERUSERID) ") AS acldefault "
+					   "FROM pg_catalog.pg_parameter_acl "
+					   "ORDER BY 1");
 
 	if (PQntuples(res) > 0)
-		fprintf(OPF, "--\n-- Role memberships\n--\n\n");
+		fprintf(OPF, "--\n-- Role privileges on configuration parameters\n--\n\n");
 
 	for (i = 0; i < PQntuples(res); i++)
 	{
-		char	   *groname = PQgetvalue(res, i, 0);
-		char	   *grolist = PQgetvalue(res, i, 1);
-		PGresult   *res2;
-		int			j;
+		PQExpBuffer buf = createPQExpBuffer();
+		char	   *parname = PQgetvalue(res, i, 0);
+		char	   *parowner = PQgetvalue(res, i, 1);
+		char	   *paracl = PQgetvalue(res, i, 2);
+		char	   *acldefault = PQgetvalue(res, i, 3);
+		char	   *fparname;
 
-		/*
-		 * Array representation is {1,2,3} ... convert to (1,2,3)
-		 */
-		if (strlen(grolist) < 3)
-			continue;
+		/* needed for buildACLCommands() */
+		fparname = pg_strdup(fmtId(parname));
 
-		grolist = pg_strdup(grolist);
-		grolist[0] = '(';
-		grolist[strlen(grolist) - 1] = ')';
-		printfPQExpBuffer(buf,
-						  "SELECT usename FROM pg_shadow "
-						  "WHERE usesysid IN %s ORDER BY 1",
-						  grolist);
-		free(grolist);
-
-		res2 = executeQuery(conn, buf->data);
-
-		for (j = 0; j < PQntuples(res2); j++)
+		if (!buildACLCommands(fparname, NULL, NULL, "PARAMETER",
+							  paracl, acldefault,
+							  parowner, "", server_version, buf))
 		{
-			char	   *usename = PQgetvalue(res2, j, 0);
-
-			/*
-			 * Don't try to grant a role to itself; can happen if old
-			 * installation has identically named user and group.
-			 */
-			if (strcmp(groname, usename) == 0)
-				continue;
-
-			fprintf(OPF, "GRANT %s", fmtId(groname));
-			fprintf(OPF, " TO %s;\n", fmtId(usename));
+			pg_log_error("could not parse ACL list (%s) for parameter \"%s\"",
+						 paracl, parname);
+			PQfinish(conn);
+			exit_nicely(1);
 		}
 
-		PQclear(res2);
+		fprintf(OPF, "%s", buf->data);
+
+		free(fparname);
+		destroyPQExpBuffer(buf);
 	}
 
 	PQclear(res);
-	destroyPQExpBuffer(buf);
-
 	fprintf(OPF, "\n\n");
 }
 
@@ -1161,85 +1246,16 @@ dumpTablespaces(PGconn *conn)
 	/*
 	 * Get all tablespaces except built-in ones (which we assume are named
 	 * pg_xxx)
-	 *
-	 * For the tablespace ACLs, as of 9.6, we extract both the positive (as
-	 * spcacl) and negative (as rspcacl) ACLs, relative to the default ACL for
-	 * tablespaces, which are then passed to buildACLCommands() below.
-	 *
-	 * See buildACLQueries() and buildACLCommands().
-	 *
-	 * The order in which privileges are in the ACL string (the order they
-	 * have been GRANT'd in, which the backend maintains) must be preserved to
-	 * ensure that GRANTs WITH GRANT OPTION and subsequent GRANTs based on
-	 * those are dumped in the correct order.
-	 *
-	 * Note that we do not support initial privileges (pg_init_privs) on
-	 * tablespaces, so this logic cannot make use of buildACLQueries().
 	 */
-	if (server_version >= 90600)
-		res = executeQuery(conn, "SELECT oid, spcname, "
-						   "pg_catalog.pg_get_userbyid(spcowner) AS spcowner, "
-						   "pg_catalog.pg_tablespace_location(oid), "
-						   "(SELECT array_agg(acl ORDER BY row_n) FROM "
-						   "  (SELECT acl, row_n FROM "
-						   "     unnest(coalesce(spcacl,acldefault('t',spcowner))) "
-						   "     WITH ORDINALITY AS perm(acl,row_n) "
-						   "   WHERE NOT EXISTS ( "
-						   "     SELECT 1 "
-						   "     FROM unnest(acldefault('t',spcowner)) "
-						   "       AS init(init_acl) "
-						   "     WHERE acl = init_acl)) AS spcacls) "
-						   " AS spcacl, "
-						   "(SELECT array_agg(acl ORDER BY row_n) FROM "
-						   "  (SELECT acl, row_n FROM "
-						   "     unnest(acldefault('t',spcowner)) "
-						   "     WITH ORDINALITY AS initp(acl,row_n) "
-						   "   WHERE NOT EXISTS ( "
-						   "     SELECT 1 "
-						   "     FROM unnest(coalesce(spcacl,acldefault('t',spcowner))) "
-						   "       AS permp(orig_acl) "
-						   "     WHERE acl = orig_acl)) AS rspcacls) "
-						   " AS rspcacl, "
-						   "array_to_string(spcoptions, ', '),"
-						   "pg_catalog.shobj_description(oid, 'pg_tablespace') "
-						   "FROM pg_catalog.pg_tablespace "
-						   "WHERE spcname !~ '^pg_' "
-						   "ORDER BY 1");
-	else if (server_version >= 90200)
-		res = executeQuery(conn, "SELECT oid, spcname, "
-						   "pg_catalog.pg_get_userbyid(spcowner) AS spcowner, "
-						   "pg_catalog.pg_tablespace_location(oid), "
-						   "spcacl, '' as rspcacl, "
-						   "array_to_string(spcoptions, ', '),"
-						   "pg_catalog.shobj_description(oid, 'pg_tablespace') "
-						   "FROM pg_catalog.pg_tablespace "
-						   "WHERE spcname !~ '^pg_' "
-						   "ORDER BY 1");
-	else if (server_version >= 90000)
-		res = executeQuery(conn, "SELECT oid, spcname, "
-						   "pg_catalog.pg_get_userbyid(spcowner) AS spcowner, "
-						   "spclocation, spcacl, '' as rspcacl, "
-						   "array_to_string(spcoptions, ', '),"
-						   "pg_catalog.shobj_description(oid, 'pg_tablespace') "
-						   "FROM pg_catalog.pg_tablespace "
-						   "WHERE spcname !~ '^pg_' "
-						   "ORDER BY 1");
-	else if (server_version >= 80200)
-		res = executeQuery(conn, "SELECT oid, spcname, "
-						   "pg_catalog.pg_get_userbyid(spcowner) AS spcowner, "
-						   "spclocation, spcacl, '' as rspcacl, null, "
-						   "pg_catalog.shobj_description(oid, 'pg_tablespace') "
-						   "FROM pg_catalog.pg_tablespace "
-						   "WHERE spcname !~ '^pg_' "
-						   "ORDER BY 1");
-	else
-		res = executeQuery(conn, "SELECT oid, spcname, "
-						   "pg_catalog.pg_get_userbyid(spcowner) AS spcowner, "
-						   "spclocation, spcacl, '' as rspcacl, "
-						   "null, null "
-						   "FROM pg_catalog.pg_tablespace "
-						   "WHERE spcname !~ '^pg_' "
-						   "ORDER BY 1");
+	res = executeQuery(conn, "SELECT oid, spcname, "
+					   "pg_catalog.pg_get_userbyid(spcowner) AS spcowner, "
+					   "pg_catalog.pg_tablespace_location(oid), "
+					   "spcacl, acldefault('t', spcowner) AS acldefault, "
+					   "array_to_string(spcoptions, ', '),"
+					   "pg_catalog.shobj_description(oid, 'pg_tablespace') "
+					   "FROM pg_catalog.pg_tablespace "
+					   "WHERE spcname !~ '^pg_' "
+					   "ORDER BY 1");
 
 	if (PQntuples(res) > 0)
 		fprintf(OPF, "--\n-- Tablespaces\n--\n\n");
@@ -1252,7 +1268,7 @@ dumpTablespaces(PGconn *conn)
 		char	   *spcowner = PQgetvalue(res, i, 2);
 		char	   *spclocation = PQgetvalue(res, i, 3);
 		char	   *spcacl = PQgetvalue(res, i, 4);
-		char	   *rspcacl = PQgetvalue(res, i, 5);
+		char	   *acldefault = PQgetvalue(res, i, 5);
 		char	   *spcoptions = PQgetvalue(res, i, 6);
 		char	   *spccomment = PQgetvalue(res, i, 7);
 		char	   *fspcname;
@@ -1260,20 +1276,37 @@ dumpTablespaces(PGconn *conn)
 		/* needed for buildACLCommands() */
 		fspcname = pg_strdup(fmtId(spcname));
 
+		if (binary_upgrade)
+		{
+			appendPQExpBufferStr(buf, "\n-- For binary upgrade, must preserve pg_tablespace oid\n");
+			appendPQExpBuffer(buf, "SELECT pg_catalog.binary_upgrade_set_next_pg_tablespace_oid('%u'::pg_catalog.oid);\n", spcoid);
+		}
+
 		appendPQExpBuffer(buf, "CREATE TABLESPACE %s", fspcname);
 		appendPQExpBuffer(buf, " OWNER %s", fmtId(spcowner));
 
 		appendPQExpBufferStr(buf, " LOCATION ");
-		appendStringLiteralConn(buf, spclocation, conn);
+
+		/*
+		 * In-place tablespaces use a relative path, and need to be dumped
+		 * with an empty string as location.
+		 */
+		if (is_absolute_path(spclocation))
+			appendStringLiteralConn(buf, spclocation, conn);
+		else
+			appendStringLiteralConn(buf, "", conn);
+
 		appendPQExpBufferStr(buf, ";\n");
 
 		if (spcoptions && spcoptions[0] != '\0')
 			appendPQExpBuffer(buf, "ALTER TABLESPACE %s SET (%s);\n",
 							  fspcname, spcoptions);
 
+		/* tablespaces can't have initprivs */
+
 		if (!skip_acls &&
 			!buildACLCommands(fspcname, NULL, NULL, "TABLESPACE",
-							  spcacl, rspcacl,
+							  spcacl, acldefault,
 							  spcowner, "", server_version, buf))
 		{
 			pg_log_error("could not parse ACL list (%s) for tablespace \"%s\"",
@@ -1289,7 +1322,7 @@ dumpTablespaces(PGconn *conn)
 			appendPQExpBufferStr(buf, ";\n");
 		}
 
-		if (!no_security_labels && server_version >= 90200)
+		if (!no_security_labels)
 			buildShSecLabels(conn, "pg_tablespace", spcoid,
 							 "TABLESPACE", spcname,
 							 buf);
@@ -1321,7 +1354,7 @@ dropDBs(PGconn *conn)
 	res = executeQuery(conn,
 					   "SELECT datname "
 					   "FROM pg_database d "
-					   "WHERE datallowconn "
+					   "WHERE datallowconn AND datconnlimit != -2 "
 					   "ORDER BY datname");
 
 	if (PQntuples(res) > 0)
@@ -1359,51 +1392,30 @@ static void
 dumpUserConfig(PGconn *conn, const char *username)
 {
 	PQExpBuffer buf = createPQExpBuffer();
-	int			count = 1;
-	bool		first = true;
+	PGresult   *res;
 
-	for (;;)
+	printfPQExpBuffer(buf, "SELECT unnest(setconfig) FROM pg_db_role_setting "
+					  "WHERE setdatabase = 0 AND setrole = "
+					  "(SELECT oid FROM %s WHERE rolname = ",
+					  role_catalog);
+	appendStringLiteralConn(buf, username, conn);
+	appendPQExpBufferChar(buf, ')');
+
+	res = executeQuery(conn, buf->data);
+
+	if (PQntuples(res) > 0)
+		fprintf(OPF, "\n--\n-- User Config \"%s\"\n--\n\n", username);
+
+	for (int i = 0; i < PQntuples(res); i++)
 	{
-		PGresult   *res;
-
-		if (server_version >= 90000)
-			printfPQExpBuffer(buf, "SELECT setconfig[%d] FROM pg_db_role_setting WHERE "
-							  "setdatabase = 0 AND setrole = "
-							  "(SELECT oid FROM %s WHERE rolname = ", count, role_catalog);
-		else if (server_version >= 80100)
-			printfPQExpBuffer(buf, "SELECT rolconfig[%d] FROM %s WHERE rolname = ", count, role_catalog);
-		else
-			printfPQExpBuffer(buf, "SELECT useconfig[%d] FROM pg_shadow WHERE usename = ", count);
-		appendStringLiteralConn(buf, username, conn);
-		if (server_version >= 90000)
-			appendPQExpBufferChar(buf, ')');
-
-		res = executeQuery(conn, buf->data);
-		if (PQntuples(res) == 1 &&
-			!PQgetisnull(res, 0, 0))
-		{
-			/* comment at section start, only if needed */
-			if (first)
-			{
-				fprintf(OPF, "--\n-- User Configurations\n--\n\n");
-				first = false;
-			}
-
-			fprintf(OPF, "--\n-- User Config \"%s\"\n--\n\n", username);
-			resetPQExpBuffer(buf);
-			makeAlterConfigCommand(conn, PQgetvalue(res, 0, 0),
-								   "ROLE", username, NULL, NULL,
-								   buf);
-			fprintf(OPF, "%s", buf->data);
-			PQclear(res);
-			count++;
-		}
-		else
-		{
-			PQclear(res);
-			break;
-		}
+		resetPQExpBuffer(buf);
+		makeAlterConfigCommand(conn, PQgetvalue(res, i, 0),
+							   "ROLE", username, NULL, NULL,
+							   buf);
+		fprintf(OPF, "%s", buf->data);
 	}
+
+	PQclear(res);
 
 	destroyPQExpBuffer(buf);
 }
@@ -1433,10 +1445,21 @@ expand_dbname_patterns(PGconn *conn,
 
 	for (SimpleStringListCell *cell = patterns->head; cell; cell = cell->next)
 	{
+		int			dotcnt;
+
 		appendPQExpBufferStr(query,
 							 "SELECT datname FROM pg_catalog.pg_database n\n");
 		processSQLNamePattern(conn, query, cell->val, false,
-							  false, NULL, "datname", NULL, NULL);
+							  false, NULL, "datname", NULL, NULL, NULL,
+							  &dotcnt);
+
+		if (dotcnt > 0)
+		{
+			pg_log_error("improper qualified name (too many dotted names): %s",
+						 cell->val);
+			PQfinish(conn);
+			exit_nicely(1);
+		}
 
 		res = executeQuery(conn, query->data);
 		for (int i = 0; i < PQntuples(res); i++)
@@ -1474,7 +1497,7 @@ dumpDatabases(PGconn *conn)
 	res = executeQuery(conn,
 					   "SELECT datname "
 					   "FROM pg_database d "
-					   "WHERE datallowconn "
+					   "WHERE datallowconn AND datconnlimit != -2 "
 					   "ORDER BY (datname <> 'template1'), datname");
 
 	if (PQntuples(res) > 0)
@@ -1528,22 +1551,15 @@ dumpDatabases(PGconn *conn)
 
 		ret = runPgDump(dbname, create_opts);
 		if (ret != 0)
-		{
-			pg_log_error("pg_dump failed on database \"%s\", exiting", dbname);
-			exit_nicely(1);
-		}
+			pg_fatal("pg_dump failed on database \"%s\", exiting", dbname);
 
 		if (filename)
 		{
 			OPF = fopen(filename, PG_BINARY_A);
 			if (!OPF)
-			{
-				pg_log_error("could not re-open the output file \"%s\": %m",
-							 filename);
-				exit_nicely(1);
-			}
+				pg_fatal("could not re-open the output file \"%s\": %m",
+						 filename);
 		}
-
 	}
 
 	PQclear(res);
@@ -1557,11 +1573,14 @@ dumpDatabases(PGconn *conn)
 static int
 runPgDump(const char *dbname, const char *create_opts)
 {
-	PQExpBuffer connstrbuf = createPQExpBuffer();
-	PQExpBuffer cmd = createPQExpBuffer();
+	PQExpBufferData connstrbuf;
+	PQExpBufferData cmd;
 	int			ret;
 
-	appendPQExpBuffer(cmd, "\"%s\" %s %s", pg_dump_bin,
+	initPQExpBuffer(&connstrbuf);
+	initPQExpBuffer(&cmd);
+
+	printfPQExpBuffer(&cmd, "\"%s\" %s %s", pg_dump_bin,
 					  pgdumpopts->data, create_opts);
 
 	/*
@@ -1569,28 +1588,27 @@ runPgDump(const char *dbname, const char *create_opts)
 	 * format.
 	 */
 	if (filename)
-		appendPQExpBufferStr(cmd, " -Fa ");
+		appendPQExpBufferStr(&cmd, " -Fa ");
 	else
-		appendPQExpBufferStr(cmd, " -Fp ");
+		appendPQExpBufferStr(&cmd, " -Fp ");
 
 	/*
 	 * Append the database name to the already-constructed stem of connection
 	 * string.
 	 */
-	appendPQExpBuffer(connstrbuf, "%s dbname=", connstr);
-	appendConnStrVal(connstrbuf, dbname);
+	appendPQExpBuffer(&connstrbuf, "%s dbname=", connstr);
+	appendConnStrVal(&connstrbuf, dbname);
 
-	appendShellString(cmd, connstrbuf->data);
+	appendShellString(&cmd, connstrbuf.data);
 
-	pg_log_info("running \"%s\"", cmd->data);
+	pg_log_info("running \"%s\"", cmd.data);
 
-	fflush(stdout);
-	fflush(stderr);
+	fflush(NULL);
 
-	ret = system(cmd->data);
+	ret = system(cmd.data);
 
-	destroyPQExpBuffer(cmd);
-	destroyPQExpBuffer(connstrbuf);
+	termPQExpBuffer(&cmd);
+	termPQExpBuffer(&connstrbuf);
 
 	return ret;
 }
@@ -1660,12 +1678,9 @@ connectDatabase(const char *dbname, const char *connection_string,
 		char	   *err_msg = NULL;
 		int			i = 0;
 
-		if (keywords)
-			free(keywords);
-		if (values)
-			free(values);
-		if (conn_opts)
-			PQconninfoFree(conn_opts);
+		free(keywords);
+		free(values);
+		PQconninfoFree(conn_opts);
 
 		/*
 		 * Merge the connection info inputs given in form of connection string
@@ -1677,10 +1692,7 @@ connectDatabase(const char *dbname, const char *connection_string,
 		{
 			conn_opts = PQconninfoParse(connection_string, &err_msg);
 			if (conn_opts == NULL)
-			{
-				pg_log_error("%s", err_msg);
-				exit_nicely(1);
-			}
+				pg_fatal("%s", err_msg);
 
 			for (conn_opt = conn_opts; conn_opt->keyword != NULL; conn_opt++)
 			{
@@ -1747,10 +1759,7 @@ connectDatabase(const char *dbname, const char *connection_string,
 		conn = PQconnectdbParams(keywords, values, true);
 
 		if (!conn)
-		{
-			pg_log_error("could not connect to database \"%s\"", dbname);
-			exit_nicely(1);
-		}
+			pg_fatal("could not connect to database \"%s\"", dbname);
 
 		if (PQstatus(conn) == CONNECTION_BAD &&
 			PQconnectionNeedsPassword(conn) &&
@@ -1767,10 +1776,7 @@ connectDatabase(const char *dbname, const char *connection_string,
 	if (PQstatus(conn) == CONNECTION_BAD)
 	{
 		if (fail_on_error)
-		{
-			pg_log_error("%s", PQerrorMessage(conn));
-			exit_nicely(1);
-		}
+			pg_fatal("%s", PQerrorMessage(conn));
 		else
 		{
 			PQfinish(conn);
@@ -1796,31 +1802,25 @@ connectDatabase(const char *dbname, const char *connection_string,
 	/* Check version */
 	remoteversion_str = PQparameterStatus(conn, "server_version");
 	if (!remoteversion_str)
-	{
-		pg_log_error("could not get server version");
-		exit_nicely(1);
-	}
+		pg_fatal("could not get server version");
 	server_version = PQserverVersion(conn);
 	if (server_version == 0)
-	{
-		pg_log_error("could not parse server version \"%s\"",
-					 remoteversion_str);
-		exit_nicely(1);
-	}
+		pg_fatal("could not parse server version \"%s\"",
+				 remoteversion_str);
 
 	my_version = PG_VERSION_NUM;
 
 	/*
-	 * We allow the server to be back to 8.0, and up to any minor release of
+	 * We allow the server to be back to 9.2, and up to any minor release of
 	 * our own major version.  (See also version check in pg_dump.c.)
 	 */
 	if (my_version != server_version
-		&& (server_version < 80000 ||
+		&& (server_version < 90200 ||
 			(server_version / 100) > (my_version / 100)))
 	{
-		pg_log_error("server version: %s; %s version: %s",
-					 remoteversion_str, progname, PG_VERSION);
 		pg_log_error("aborting because of server version mismatch");
+		pg_log_error_detail("server version: %s; %s version: %s",
+							remoteversion_str, progname, PG_VERSION);
 		exit_nicely(1);
 	}
 
@@ -1882,7 +1882,7 @@ executeQuery(PGconn *conn, const char *query)
 		PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
 		pg_log_error("query failed: %s", PQerrorMessage(conn));
-		pg_log_error("query was: %s", query);
+		pg_log_error_detail("Query was: %s", query);
 		PQfinish(conn);
 		exit_nicely(1);
 	}
@@ -1905,7 +1905,7 @@ executeCommand(PGconn *conn, const char *query)
 		PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
 		pg_log_error("query failed: %s", PQerrorMessage(conn));
-		pg_log_error("query was: %s", query);
+		pg_log_error_detail("Query was: %s", query);
 		PQfinish(conn);
 		exit_nicely(1);
 	}
@@ -1925,4 +1925,15 @@ dumpTimestamp(const char *msg)
 
 	if (strftime(buf, sizeof(buf), PGDUMP_STRFTIME_FMT, localtime(&now)) != 0)
 		fprintf(OPF, "-- %s %s\n\n", msg, buf);
+}
+
+/*
+ * Helper function for rolename_hash hash table.
+ */
+static uint32
+hash_string_pointer(char *s)
+{
+	unsigned char *ss = (unsigned char *) s;
+
+	return hash_bytes(ss, strlen(s));
 }

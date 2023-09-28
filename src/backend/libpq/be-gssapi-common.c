@@ -3,7 +3,7 @@
  * be-gssapi-common.c
  *     Common code for GSSAPI authentication and encryption
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -29,8 +29,6 @@ pg_GSS_error_int(char *s, size_t len, OM_uint32 stat, int type)
 	OM_uint32	lmin_s,
 				msg_ctx = 0;
 
-	s[0] = '\0';				/* just in case gss_display_status fails */
-
 	do
 	{
 		if (gss_display_status(&lmin_s, stat, type, GSS_C_NO_OID,
@@ -43,16 +41,19 @@ pg_GSS_error_int(char *s, size_t len, OM_uint32 stat, int type)
 			i++;
 		}
 		if (i < len)
-			strlcpy(s + i, gmsg.value, len - i);
+			memcpy(s + i, gmsg.value, Min(len - i, gmsg.length));
 		i += gmsg.length;
 		gss_release_buffer(&lmin_s, &gmsg);
 	}
 	while (msg_ctx);
 
-	if (i >= len)
+	/* add nul termination */
+	if (i < len)
+		s[i] = '\0';
+	else
 	{
 		elog(COMMERROR, "incomplete GSS error report");
-		s[len - 1] = '\0';		/* ensure string is nul-terminated */
+		s[len - 1] = '\0';
 	}
 }
 
@@ -90,4 +91,57 @@ pg_GSS_error(const char *errmsg,
 	ereport(COMMERROR,
 			(errmsg_internal("%s", errmsg),
 			 errdetail_internal("%s: %s", msg_major, msg_minor)));
+}
+
+/*
+ * Store the credentials passed in into the memory cache for later usage.
+ *
+ * This allows credentials to be delegated to us for us to use to connect
+ * to other systems with, using, e.g. postgres_fdw or dblink.
+ */
+#define GSS_MEMORY_CACHE "MEMORY:"
+void
+pg_store_delegated_credential(gss_cred_id_t cred)
+{
+	OM_uint32	major,
+				minor;
+	gss_OID_set mech;
+	gss_cred_usage_t usage;
+	gss_key_value_element_desc cc;
+	gss_key_value_set_desc ccset;
+
+	cc.key = "ccache";
+	cc.value = GSS_MEMORY_CACHE;
+	ccset.count = 1;
+	ccset.elements = &cc;
+
+	/* Make the delegated credential only available to current process */
+	major = gss_store_cred_into(&minor,
+								cred,
+								GSS_C_INITIATE, /* credential only used for
+												 * starting libpq connection */
+								GSS_C_NULL_OID, /* store all */
+								true,	/* overwrite */
+								true,	/* make default */
+								&ccset,
+								&mech,
+								&usage);
+
+	if (major != GSS_S_COMPLETE)
+	{
+		pg_GSS_error("gss_store_cred", major, minor);
+	}
+
+	/* Credential stored, so we can release our credential handle. */
+	major = gss_release_cred(&minor, &cred);
+	if (major != GSS_S_COMPLETE)
+	{
+		pg_GSS_error("gss_release_cred", major, minor);
+	}
+
+	/*
+	 * Set KRB5CCNAME for this backend, so that later calls to
+	 * gss_acquire_cred will find the delegated credentials we stored.
+	 */
+	setenv("KRB5CCNAME", GSS_MEMORY_CACHE, 1);
 }

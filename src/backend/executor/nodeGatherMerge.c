@@ -3,7 +3,7 @@
  * nodeGatherMerge.c
  *		Scan a plan in multiple workers, and do order-preserving merge.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -212,13 +212,13 @@ ExecGatherMerge(PlanState *pstate)
 
 			/* Initialize, or re-initialize, shared state needed by workers. */
 			if (!node->pei)
-				node->pei = ExecInitParallelPlan(node->ps.lefttree,
+				node->pei = ExecInitParallelPlan(outerPlanState(node),
 												 estate,
 												 gm->initParam,
 												 gm->num_workers,
 												 node->tuples_needed);
 			else
-				ExecParallelReinitialize(node->ps.lefttree,
+				ExecParallelReinitialize(outerPlanState(node),
 										 node->pei,
 										 gm->initParam);
 
@@ -290,9 +290,6 @@ ExecEndGatherMerge(GatherMergeState *node)
 {
 	ExecEndNode(outerPlanState(node));	/* let children clean up first */
 	ExecShutdownGatherMerge(node);
-	ExecFreeExprContext(&node->ps);
-	if (node->ps.ps_ResultTupleSlot)
-		ExecClearTuple(node->ps.ps_ResultTupleSlot);
 }
 
 /* ----------------------------------------------------------------

@@ -3,7 +3,7 @@
 --
 -- Use hand-rolled hash functions and operator classes to get predictable
 -- result on different machines.  See the definitions of
--- part_part_test_int4_ops and part_test_text_ops in insert.sql.
+-- part_test_int4_ops and part_test_text_ops in test_setup.sql.
 CREATE TABLE mchash (a int, b text, c jsonb)
   PARTITION BY HASH (a part_test_int4_ops, b part_test_text_ops);
 CREATE TABLE mchash1
@@ -19,10 +19,10 @@ SELECT satisfies_hash_partition('mchash1'::regclass, 4, 0, NULL);
 ERROR:  "mchash1" is not a hash partitioned table
 -- invalid modulus
 SELECT satisfies_hash_partition('mchash'::regclass, 0, 0, NULL);
-ERROR:  modulus for hash partition must be a positive integer
+ERROR:  modulus for hash partition must be an integer value greater than zero
 -- remainder too small
 SELECT satisfies_hash_partition('mchash'::regclass, 1, -1, NULL);
-ERROR:  remainder for hash partition must be a non-negative integer
+ERROR:  remainder for hash partition must be an integer value greater than or equal to zero
 -- remainder too large
 SELECT satisfies_hash_partition('mchash'::regclass, 1, 1, NULL);
 ERROR:  remainder for hash partition must be less than modulus

@@ -37,6 +37,10 @@ select * from pg_database where pg_database.datname = nonesuch;
 -- bad attribute name in select distinct on
 select distinct on (foobar) * from pg_database;
 
+-- grouping with FOR UPDATE
+select null from pg_database group by datname for update;
+select null from pg_database group by grouping sets (()) for update;
+
 
 --
 -- DELETE
@@ -73,7 +77,7 @@ alter table nonesuch rename to newnonesuch;
 alter table nonesuch rename to stud_emp;
 
 -- conflict
-alter table stud_emp rename to aggtest;
+alter table stud_emp rename to student;
 
 -- self-conflict
 alter table stud_emp rename to stud_emp;

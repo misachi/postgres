@@ -3,7 +3,7 @@
  * functions.c
  *	  Execution of SQL-language functions
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -245,8 +245,7 @@ prepare_sql_fn_parse_info(HeapTuple procedureTuple,
 		if (isNull)
 			proargmodes = PointerGetDatum(NULL);	/* just to be sure */
 
-		n_arg_names = get_func_input_arg_names(procedureStruct->prokind,
-											   proargnames, proargmodes,
+		n_arg_names = get_func_input_arg_names(proargnames, proargmodes,
 											   &pinfo->argnames);
 
 		/* Paranoia: ignore the result if too few array entries */
@@ -319,12 +318,10 @@ sql_fn_post_column_ref(ParseState *pstate, ColumnRef *cref, Node *var)
 		nnames--;
 
 	field1 = (Node *) linitial(cref->fields);
-	Assert(IsA(field1, String));
 	name1 = strVal(field1);
 	if (nnames > 1)
 	{
 		subfield = (Node *) lsecond(cref->fields);
-		Assert(IsA(subfield, String));
 		name2 = strVal(subfield);
 	}
 
@@ -512,13 +509,13 @@ init_execution_state(List *queryTree_list,
 					((CopyStmt *) stmt->utilityStmt)->filename == NULL)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("cannot COPY to/from client in a SQL function")));
+							 errmsg("cannot COPY to/from client in an SQL function")));
 
 				if (IsA(stmt->utilityStmt, TransactionStmt))
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					/* translator: %s is a SQL statement name */
-							 errmsg("%s is not allowed in a SQL function",
+							 errmsg("%s is not allowed in an SQL function",
 									CreateCommandName(stmt->utilityStmt))));
 			}
 
@@ -663,12 +660,7 @@ init_sql_fcache(FunctionCallInfo fcinfo, Oid collation, bool lazyEvalOK)
 	/*
 	 * And of course we need the function body text.
 	 */
-	tmp = SysCacheGetAttr(PROCOID,
-						  procedureTuple,
-						  Anum_pg_proc_prosrc,
-						  &isNull);
-	if (isNull)
-		elog(ERROR, "null prosrc for function %u", foid);
+	tmp = SysCacheGetAttrNotNull(PROCOID, procedureTuple, Anum_pg_proc_prosrc);
 	fcache->src = TextDatumGetCString(tmp);
 
 	/* If we have prosqlbody, pay attention to that not prosrc. */
@@ -719,7 +711,7 @@ init_sql_fcache(FunctionCallInfo fcinfo, Oid collation, bool lazyEvalOK)
 			RawStmt    *parsetree = lfirst_node(RawStmt, lc);
 			List	   *queryTree_sublist;
 
-			queryTree_sublist = pg_analyze_and_rewrite_params(parsetree,
+			queryTree_sublist = pg_analyze_and_rewrite_withcb(parsetree,
 															  fcache->src,
 															  (ParserSetupHook) sql_fn_parser_setup,
 															  fcache->pinfo,
@@ -887,6 +879,7 @@ postquel_getnext(execution_state *es, SQLFunctionCachePtr fcache)
 	{
 		ProcessUtility(es->qd->plannedstmt,
 					   fcache->src,
+					   true,	/* protect function cache's parsetree */
 					   PROCESS_UTILITY_QUERY,
 					   es->qd->params,
 					   es->qd->queryEnv,
@@ -941,6 +934,7 @@ postquel_sub_params(SQLFunctionCachePtr fcache,
 	if (nargs > 0)
 	{
 		ParamListInfo paramLI;
+		Oid		   *argtypes = fcache->pinfo->argtypes;
 
 		if (fcache->paramLI == NULL)
 		{
@@ -957,10 +951,24 @@ postquel_sub_params(SQLFunctionCachePtr fcache,
 		{
 			ParamExternData *prm = &paramLI->params[i];
 
-			prm->value = fcinfo->args[i].value;
+			/*
+			 * If an incoming parameter value is a R/W expanded datum, we
+			 * force it to R/O.  We'd be perfectly entitled to scribble on it,
+			 * but the problem is that if the parameter is referenced more
+			 * than once in the function, earlier references might mutate the
+			 * value seen by later references, which won't do at all.  We
+			 * could do better if we could be sure of the number of Param
+			 * nodes in the function's plans; but we might not have planned
+			 * all the statements yet, nor do we have plan tree walker
+			 * infrastructure.  (Examining the parse trees is not good enough,
+			 * because of possible function inlining during planning.)
+			 */
 			prm->isnull = fcinfo->args[i].isnull;
+			prm->value = MakeExpandedObjectReadOnly(fcinfo->args[i].value,
+													prm->isnull,
+													get_typlen(argtypes[i]));
 			prm->pflags = 0;
-			prm->ptype = fcache->pinfo->argtypes[i];
+			prm->ptype = argtypes[i];
 		}
 	}
 	else
@@ -1536,7 +1544,7 @@ check_sql_fn_statements(List *queryTreeLists)
 			Query	   *query = lfirst_node(Query, lc2);
 
 			/*
-			 * Disallow procedures with output arguments.  The current
+			 * Disallow calling procedures with output arguments.  The current
 			 * implementation would just throw the output values away, unless
 			 * the statement is the last one.  Per SQL standard, we should
 			 * assign the output values by name.  By disallowing this here, we
@@ -1545,31 +1553,12 @@ check_sql_fn_statements(List *queryTreeLists)
 			if (query->commandType == CMD_UTILITY &&
 				IsA(query->utilityStmt, CallStmt))
 			{
-				CallStmt   *stmt = castNode(CallStmt, query->utilityStmt);
-				HeapTuple	tuple;
-				int			numargs;
-				Oid		   *argtypes;
-				char	  **argnames;
-				char	   *argmodes;
-				int			i;
+				CallStmt   *stmt = (CallStmt *) query->utilityStmt;
 
-				tuple = SearchSysCache1(PROCOID,
-										ObjectIdGetDatum(stmt->funcexpr->funcid));
-				if (!HeapTupleIsValid(tuple))
-					elog(ERROR, "cache lookup failed for function %u",
-						 stmt->funcexpr->funcid);
-				numargs = get_func_arg_info(tuple,
-											&argtypes, &argnames, &argmodes);
-				ReleaseSysCache(tuple);
-
-				for (i = 0; i < numargs; i++)
-				{
-					if (argmodes && (argmodes[i] == PROARGMODE_INOUT ||
-									 argmodes[i] == PROARGMODE_OUT))
-						ereport(ERROR,
-								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								 errmsg("calling procedures with output arguments is not supported in SQL functions")));
-				}
+				if (stmt->outargs != NIL)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("calling procedures with output arguments is not supported in SQL functions")));
 			}
 		}
 	}

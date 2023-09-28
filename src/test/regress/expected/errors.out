@@ -50,6 +50,11 @@ select distinct on (foobar) * from pg_database;
 ERROR:  column "foobar" does not exist
 LINE 1: select distinct on (foobar) * from pg_database;
                             ^
+-- grouping with FOR UPDATE
+select null from pg_database group by datname for update;
+ERROR:  FOR UPDATE is not allowed with GROUP BY clause
+select null from pg_database group by grouping sets (()) for update;
+ERROR:  FOR UPDATE is not allowed with GROUP BY clause
 --
 -- DELETE
 -- missing relation name (this had better not wildcard!)
@@ -87,8 +92,8 @@ ERROR:  relation "nonesuch" does not exist
 alter table nonesuch rename to stud_emp;
 ERROR:  relation "nonesuch" does not exist
 -- conflict
-alter table stud_emp rename to aggtest;
-ERROR:  relation "aggtest" already exists
+alter table stud_emp rename to student;
+ERROR:  relation "student" already exists
 -- self-conflict
 alter table stud_emp rename to stud_emp;
 ERROR:  relation "stud_emp" already exists

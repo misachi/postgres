@@ -183,4 +183,11 @@ PQenterPipelineMode       180
 PQexitPipelineMode        181
 PQpipelineSync            182
 PQpipelineStatus          183
-PQtraceSetFlags           184
+PQsetTraceFlags           184
+PQmblenBounded            185
+PQsendFlushRequest        186
+PQconnectionUsedGSSAPI    187
+PQclosePrepared           188
+PQclosePortal             189
+PQsendClosePrepared       190
+PQsendClosePortal         191

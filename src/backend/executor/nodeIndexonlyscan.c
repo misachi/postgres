@@ -3,7 +3,7 @@
  * nodeIndexonlyscan.c
  *	  Routines to support index-only scans
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -70,15 +70,13 @@ IndexOnlyNext(IndexOnlyScanState *node)
 	 * extract necessary information from index scan node
 	 */
 	estate = node->ss.ps.state;
-	direction = estate->es_direction;
-	/* flip direction if this is an overall backward scan */
-	if (ScanDirectionIsBackward(((IndexOnlyScan *) node->ss.ps.plan)->indexorderdir))
-	{
-		if (ScanDirectionIsForward(direction))
-			direction = BackwardScanDirection;
-		else if (ScanDirectionIsBackward(direction))
-			direction = ForwardScanDirection;
-	}
+
+	/*
+	 * Determine which direction to scan the index in based on the plan's scan
+	 * direction and the current direction of execution.
+	 */
+	direction = ScanDirectionCombine(estate->es_direction,
+									 ((IndexOnlyScan *) node->ss.ps.plan)->indexorderdir);
 	scandesc = node->ioss_ScanDesc;
 	econtext = node->ss.ps.ps_ExprContext;
 	slot = node->ss.ss_ScanTupleSlot;
@@ -214,13 +212,11 @@ IndexOnlyNext(IndexOnlyScanState *node)
 
 		/*
 		 * If the index was lossy, we have to recheck the index quals.
-		 * (Currently, this can never happen, but we should support the case
-		 * for possible future use, eg with GiST indexes.)
 		 */
 		if (scandesc->xs_recheck)
 		{
 			econtext->ecxt_scantuple = slot;
-			if (!ExecQualAndReset(node->indexqual, econtext))
+			if (!ExecQualAndReset(node->recheckqual, econtext))
 			{
 				/* Fails recheck, so drop it and loop back for another */
 				InstrCountFiltered2(node, 1);
@@ -385,22 +381,6 @@ ExecEndIndexOnlyScan(IndexOnlyScanState *node)
 	}
 
 	/*
-	 * Free the exprcontext(s) ... now dead code, see ExecFreeExprContext
-	 */
-#ifdef NOT_USED
-	ExecFreeExprContext(&node->ss.ps);
-	if (node->ioss_RuntimeContext)
-		FreeExprContext(node->ioss_RuntimeContext, true);
-#endif
-
-	/*
-	 * clear out tuple table slots
-	 */
-	if (node->ss.ps.ps_ResultTupleSlot)
-		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
-
-	/*
 	 * close the index relation (no-op if we didn't open it)
 	 */
 	if (indexScanDesc)
@@ -555,8 +535,8 @@ ExecInitIndexOnlyScan(IndexOnlyScan *node, EState *estate, int eflags)
 	 */
 	indexstate->ss.ps.qual =
 		ExecInitQual(node->scan.plan.qual, (PlanState *) indexstate);
-	indexstate->indexqual =
-		ExecInitQual(node->indexqual, (PlanState *) indexstate);
+	indexstate->recheckqual =
+		ExecInitQual(node->recheckqual, (PlanState *) indexstate);
 
 	/*
 	 * If we are just doing EXPLAIN (ie, aren't going to run the plan), stop

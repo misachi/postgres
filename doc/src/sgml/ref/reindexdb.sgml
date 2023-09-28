@@ -208,7 +208,7 @@ PostgreSQL documentation
       <term><option>--system</option></term>
       <listitem>
        <para>
-        Reindex database's system catalogs.
+        Reindex database's system catalogs only.
        </para>
       </listitem>
      </varlistentry>
@@ -431,20 +431,6 @@ PostgreSQL documentation
   </para>
 
  </refsect1>
-
-
- <refsect1>
-  <title>Notes</title>
-
-  <para>
-   <application>reindexdb</application> might need to connect several
-   times to the <productname>PostgreSQL</productname> server, asking
-   for a password each time. It is convenient to have a
-   <filename>~/.pgpass</filename> file in such cases. See <xref
-   linkend="libpq-pgpass"/> for more information.
-  </para>
- </refsect1>
-
 
  <refsect1>
   <title>Examples</title>

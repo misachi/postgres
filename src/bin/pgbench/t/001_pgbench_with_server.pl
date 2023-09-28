@@ -1,83 +1,63 @@
 
-# Copyright (c) 2021, PostgreSQL Global Development Group
+# Copyright (c) 2021-2023, PostgreSQL Global Development Group
 
 use strict;
 use warnings;
 
-use PostgresNode;
-use TestLib;
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
 use Test::More;
-use Config;
 
-# start a pgbench specific server
-my $node = get_new_node('main');
-$node->init;
-$node->start;
-
-# invoke pgbench, with parameters:
-#   $opts: options as a string to be split on spaces
-#   $stat: expected exit status
-#   $out: reference to a regexp list that must match stdout
-#   $err: reference to a regexp list that must match stderr
-#   $name: name of test for error messages
-#   $files: reference to filename/contents dictionary
-#   @args: further raw options or arguments
-sub pgbench
+# Check the initial state of the data generated.  Tables for tellers and
+# branches use NULL for their filler attribute.  The table accounts uses
+# a non-NULL filler.  The history table should have no data.
+sub check_data_state
 {
 	local $Test::Builder::Level = $Test::Builder::Level + 1;
+	my $node = shift;
+	my $type = shift;
 
-	my ($opts, $stat, $out, $err, $name, $files, @args) = @_;
-	my @cmd = ('pgbench', split /\s+/, $opts);
-	my @filenames = ();
-	if (defined $files)
-	{
-
-		# note: files are ordered for determinism
-		for my $fn (sort keys %$files)
-		{
-			my $filename = $node->basedir . '/' . $fn;
-			push @cmd, '-f', $filename;
-
-			# cleanup file weight
-			$filename =~ s/\@\d+$//;
-
-			#push @filenames, $filename;
-			# filenames are expected to be unique on a test
-			if (-e $filename)
-			{
-				ok(0, "$filename must not already exist");
-				unlink $filename or die "cannot unlink $filename: $!";
-			}
-			append_to_file($filename, $$files{$fn});
-		}
-	}
-
-	push @cmd, @args;
-
-	$node->command_checks_all(\@cmd, $stat, $out, $err, $name);
-
-	# cleanup?
-	#unlink @filenames or die "cannot unlink files (@filenames): $!";
-
-	return;
+	my $sql_result = $node->safe_psql('postgres',
+		'SELECT count(*) AS null_count FROM pgbench_accounts WHERE filler IS NULL LIMIT 10;'
+	);
+	is($sql_result, '0',
+		"$type: filler column of pgbench_accounts has no NULL data");
+	$sql_result = $node->safe_psql('postgres',
+		'SELECT count(*) AS null_count FROM pgbench_branches WHERE filler IS NULL;'
+	);
+	is($sql_result, '1',
+		"$type: filler column of pgbench_branches has only NULL data");
+	$sql_result = $node->safe_psql('postgres',
+		'SELECT count(*) AS null_count FROM pgbench_tellers WHERE filler IS NULL;'
+	);
+	is($sql_result, '10',
+		"$type: filler column of pgbench_tellers has only NULL data");
+	$sql_result = $node->safe_psql('postgres',
+		'SELECT count(*) AS data_count FROM pgbench_history;');
+	is($sql_result, '0', "$type: pgbench_history has no data");
 }
+
+# start a pgbench specific server
+my $node = PostgreSQL::Test::Cluster->new('main');
+# Set to untranslated messages, to be able to compare program output with
+# expected strings.
+$node->init(extra => [ '--locale', 'C' ]);
+$node->start;
 
 # tablespace for testing, because partitioned tables cannot use pg_default
 # explicitly and we want to test that table creation with tablespace works
 # for partitioned tables.
 my $ts = $node->basedir . '/regress_pgbench_tap_1_ts_dir';
 mkdir $ts or die "cannot create directory $ts";
-# this takes care of WIN-specific path issues
-my $ets = TestLib::perl2host($ts);
 
 # the next commands will issue a syntax error if the path contains a "'"
 $node->safe_psql('postgres',
-	"CREATE TABLESPACE regress_pgbench_tap_1_ts LOCATION '$ets';");
+	"CREATE TABLESPACE regress_pgbench_tap_1_ts LOCATION '$ts';");
 
 # Test concurrent OID generation via pg_enum_oid_index.  This indirectly
 # exercises LWLock and spinlock concurrency.
 my $labels = join ',', map { "'l$_'" } 1 .. 1000;
-pgbench(
+$node->pgbench(
 	'--no-vacuum --client=5 --protocol=prepared --transactions=25',
 	0,
 	[qr{processed: 125/125}],
@@ -89,7 +69,7 @@ pgbench(
 	});
 
 # Trigger various connection errors
-pgbench(
+$node->pgbench(
 	'no-such-database',
 	1,
 	[qr{^$}],
@@ -99,13 +79,13 @@ pgbench(
 	],
 	'no such database');
 
-pgbench(
-	'-S -t 1', 1, [qr{^$}],
+$node->pgbench(
+	'-S -t 1', 1, [],
 	[qr{Perhaps you need to do initialization}],
 	'run without init');
 
 # Initialize pgbench tables scale 1
-pgbench(
+$node->pgbench(
 	'-i', 0,
 	[qr{^$}],
 	[
@@ -116,8 +96,11 @@ pgbench(
 	],
 	'pgbench scale 1 initialization',);
 
+# Check data state, after client-side data generation.
+check_data_state($node, 'client-side');
+
 # Again, with all possible options
-pgbench(
+$node->pgbench(
 	'--initialize --init-steps=dtpvg --scale=1 --unlogged-tables --fillfactor=98 --foreign-keys --quiet --tablespace=regress_pgbench_tap_1_ts --index-tablespace=regress_pgbench_tap_1_ts --partitions=2 --partition-method=hash',
 	0,
 	[qr{^$}i],
@@ -134,7 +117,7 @@ pgbench(
 	'pgbench scale 1 initialization');
 
 # Test interaction of --init-steps with legacy step-selection options
-pgbench(
+$node->pgbench(
 	'--initialize --init-steps=dtpvGvv --no-vacuum --foreign-keys --unlogged-tables --partitions=3',
 	0,
 	[qr{^$}],
@@ -150,8 +133,11 @@ pgbench(
 	],
 	'pgbench --init-steps');
 
+# Check data state, after server-side data generation.
+check_data_state($node, 'server-side');
+
 # Run all builtin scripts, for a few transactions each
-pgbench(
+$node->pgbench(
 	'--transactions=5 -Dfoo=bla --client=2 --protocol=simple --builtin=t'
 	  . ' --connect -n -v -n',
 	0,
@@ -159,12 +145,13 @@ pgbench(
 		qr{builtin: TPC-B},
 		qr{clients: 2\b},
 		qr{processed: 10/10},
-		qr{mode: simple}
+		qr{mode: simple},
+		qr{maximum number of tries: 1}
 	],
 	[qr{^$}],
 	'pgbench tpcb-like');
 
-pgbench(
+$node->pgbench(
 	'--transactions=20 --client=5 -M extended --builtin=si -C --no-vacuum -s 1',
 	0,
 	[
@@ -177,7 +164,7 @@ pgbench(
 	[qr{scale option ignored}],
 	'pgbench simple update');
 
-pgbench(
+$node->pgbench(
 	'-t 100 -c 7 -M prepared -b se --debug',
 	0,
 	[
@@ -188,7 +175,7 @@ pgbench(
 		qr{mode: prepared}
 	],
 	[
-		qr{vacuum},    qr{client 0}, qr{client 1}, qr{sending},
+		qr{vacuum}, qr{client 0}, qr{client 1}, qr{sending},
 		qr{receiving}, qr{executing}
 	],
 	'pgbench select only');
@@ -203,7 +190,7 @@ my $nthreads = 2;
 }
 
 # run custom scripts
-pgbench(
+$node->pgbench(
 	"-t 100 -c 1 -j $nthreads -M prepared -n",
 	0,
 	[
@@ -233,7 +220,7 @@ COMMIT;
 }
 	});
 
-pgbench(
+$node->pgbench(
 	'-n -t 10 -c 1 -M simple',
 	0,
 	[
@@ -254,7 +241,7 @@ COMMIT;
 }
 	});
 
-pgbench(
+$node->pgbench(
 	'-n -t 10 -c 2 -M extended',
 	0,
 	[
@@ -281,11 +268,11 @@ COMMIT;
 
 # 1. Logging neither with errors nor with statements
 $node->append_conf('postgresql.conf',
-	    "log_min_duration_statement = 0\n"
+		"log_min_duration_statement = 0\n"
 	  . "log_parameter_max_length = 0\n"
 	  . "log_parameter_max_length_on_error = 0");
 $node->reload;
-pgbench(
+$node->pgbench(
 	'-n -t1 -c1 -M prepared',
 	2,
 	[],
@@ -300,7 +287,7 @@ select $$'Valame Dios!' dijo Sancho; 'no le dije yo a vuestra merced que mirase 
 select column1::jsonb from (values (:value), (:long)) as q;
 ]
 	});
-my $log = TestLib::slurp_file($node->logfile);
+my $log = PostgreSQL::Test::Utils::slurp_file($node->logfile);
 unlike(
 	$log,
 	qr[DETAIL:  parameters: \$1 = '\{ invalid ',],
@@ -309,10 +296,10 @@ $log = undef;
 
 # 2. Logging truncated parameters on error, full with statements
 $node->append_conf('postgresql.conf',
-	    "log_parameter_max_length = -1\n"
+		"log_parameter_max_length = -1\n"
 	  . "log_parameter_max_length_on_error = 64");
 $node->reload;
-pgbench(
+$node->pgbench(
 	'-n -t1 -c1 -M prepared',
 	2,
 	[],
@@ -326,7 +313,7 @@ pgbench(
 SELECT 1 / (random() / 2)::int, :one::int, :two::int;
 }
 	});
-pgbench(
+$node->pgbench(
 	'-n -t1 -c1 -M prepared',
 	2,
 	[],
@@ -341,7 +328,7 @@ select $$'Valame Dios!' dijo Sancho; 'no le dije yo a vuestra merced que mirase 
 select column1::jsonb from (values (:value), (:long)) as q;
 ]
 	});
-$log = TestLib::slurp_file($node->logfile);
+$log = PostgreSQL::Test::Utils::slurp_file($node->logfile);
 like(
 	$log,
 	qr[DETAIL:  parameters: \$1 = '\{ invalid ', \$2 = '''Valame Dios!'' dijo Sancho; ''no le dije yo a vuestra merced que mirase bien lo que hacia\?'''],
@@ -350,11 +337,11 @@ $log = undef;
 
 # 3. Logging full parameters on error, truncated with statements
 $node->append_conf('postgresql.conf',
-	    "log_min_duration_statement = -1\n"
+		"log_min_duration_statement = -1\n"
 	  . "log_parameter_max_length = 7\n"
 	  . "log_parameter_max_length_on_error = -1");
 $node->reload;
-pgbench(
+$node->pgbench(
 	'-n -t1 -c1 -M prepared',
 	2,
 	[],
@@ -371,7 +358,7 @@ SELECT 1 / (random() / 2)::int, :one::int, :two::int;
 
 $node->append_conf('postgresql.conf', "log_min_duration_statement = 0");
 $node->reload;
-pgbench(
+$node->pgbench(
 	'-n -t1 -c1 -M prepared',
 	2,
 	[],
@@ -386,7 +373,7 @@ select $$'Valame Dios!' dijo Sancho; 'no le dije yo a vuestra merced que mirase 
 select column1::jsonb from (values (:value), (:long)) as q;
 ]
 	});
-$log = TestLib::slurp_file($node->logfile);
+$log = PostgreSQL::Test::Utils::slurp_file($node->logfile);
 like(
 	$log,
 	qr[DETAIL:  parameters: \$1 = '\{ inval\.\.\.', \$2 = '''Valame\.\.\.'],
@@ -394,7 +381,7 @@ like(
 $log = undef;
 
 # Check that bad parameters are reported during typinput phase of BIND
-pgbench(
+$node->pgbench(
 	'-n -t1 -c1 -M prepared',
 	2,
 	[],
@@ -411,14 +398,13 @@ select :value1::smallint, :value2::smallint;
 
 # Restore default logging config
 $node->append_conf('postgresql.conf',
-	    "log_min_duration_statement = -1\n"
+		"log_min_duration_statement = -1\n"
 	  . "log_parameter_max_length_on_error = 0\n"
 	  . "log_parameter_max_length = -1");
 $node->reload;
 
 # test expressions
-# command 1..3 and 23 depend on random seed which is used to call srandom.
-pgbench(
+$node->pgbench(
 	'--random-seed=5432 -t 1 -Dfoo=-10.1 -Dbla=false -Di=+3 -Dn=null -Dt=t -Df=of -Dd=1.0',
 	0,
 	[ qr{type: .*/001_pgbench_expressions}, qr{processed: 1/1} ],
@@ -426,9 +412,9 @@ pgbench(
 		qr{setting random seed to 5432\b},
 
 		# After explicit seeding, the four random checks (1-3,20) are
-		# deterministic
-		qr{command=1.: int 13\b},      # uniform random
-		qr{command=2.: int 116\b},     # exponential random
+		# deterministic; but see also magic values in checks 111,113.
+		qr{command=1.: int 17\b},      # uniform random
+		qr{command=2.: int 104\b},     # exponential random
 		qr{command=3.: int 1498\b},    # gaussian random
 		qr{command=4.: int 4\b},
 		qr{command=5.: int 5\b},
@@ -442,7 +428,7 @@ pgbench(
 		qr{command=15.: double 15\b},
 		qr{command=16.: double 16\b},
 		qr{command=17.: double 17\b},
-		qr{command=20.: int 1\b},    # zipfian random
+		qr{command=20.: int 3\b},    # zipfian random
 		qr{command=21.: double -27\b},
 		qr{command=22.: double 1024\b},
 		qr{command=23.: double 1\b},
@@ -487,7 +473,7 @@ pgbench(
 		qr{command=98.: int 5432\b},                    # :random_seed
 		qr{command=99.: int -9223372036854775808\b},    # min int
 		qr{command=100.: int 9223372036854775807\b},    # max int
-		    # pseudorandom permutation tests
+			# pseudorandom permutation tests
 		qr{command=101.: boolean true\b},
 		qr{command=102.: boolean true\b},
 		qr{command=103.: boolean true\b},
@@ -496,7 +482,6 @@ pgbench(
 		qr{command=109.: boolean true\b},
 		qr{command=110.: boolean true\b},
 		qr{command=111.: boolean true\b},
-		qr{command=112.: int 9223372036854775797\b},
 		qr{command=113.: boolean true\b},
 	],
 	'pgbench expressions',
@@ -641,17 +626,17 @@ SELECT :v0, :v1, :v2, :v3;
 \set t debug(0 <= :p and :p < :size and :p = permute(:v + :size, :size) and :p <> permute(:v + 1, :size))
 -- actual values
 \set t debug(permute(:v, 1) = 0)
-\set t debug(permute(0, 2, 5432) = 0 and permute(1, 2, 5432) = 1 and \
-             permute(0, 2, 5435) = 1 and permute(1, 2, 5435) = 0)
--- 63 bits tests
+\set t debug(permute(0, 2, 5431) = 0 and permute(1, 2, 5431) = 1 and \
+             permute(0, 2, 5433) = 1 and permute(1, 2, 5433) = 0)
+-- check permute's portability across architectures
 \set size debug(:max - 10)
-\set t debug(permute(:size-1, :size, 5432) = 5301702756001087507 and \
-             permute(:size-2, :size, 5432) = 8968485976055840695 and \
-             permute(:size-3, :size, 5432) = 6708495591295582115 and \
-             permute(:size-4, :size, 5432) = 2801794404574855121 and \
-             permute(:size-5, :size, 5432) = 1489011409218895840 and \
-             permute(:size-6, :size, 5432) = 2267749475878240183 and \
-             permute(:size-7, :size, 5432) = 1300324176838786780)
+\set t debug(permute(:size-1, :size, 5432) = 520382784483822430 and \
+             permute(:size-2, :size, 5432) = 1143715004660802862 and \
+             permute(:size-3, :size, 5432) = 447293596416496998 and \
+             permute(:size-4, :size, 5432) = 916527772266572956 and \
+             permute(:size-5, :size, 5432) = 2763809008686028849 and \
+             permute(:size-6, :size, 5432) = 8648551549198294572 and \
+             permute(:size-7, :size, 5432) = 4542876852200565125)
 }
 	});
 
@@ -664,7 +649,7 @@ $node->safe_psql('postgres',
 my $seed = int(rand(1000000000));
 for my $i (1, 2)
 {
-	pgbench(
+	$node->pgbench(
 		"--random-seed=$seed -t 1",
 		0,
 		[qr{processed: 1/1}],
@@ -690,7 +675,7 @@ my ($ret, $out, $err) = $node->psql('postgres',
 	'SELECT seed, rand, val, COUNT(*) FROM seeded_random GROUP BY seed, rand, val'
 );
 
-ok($ret == 0,  "psql seeded_random count ok");
+ok($ret == 0, "psql seeded_random count ok");
 ok($err eq '', "psql seeded_random count stderr is empty");
 ok($out =~ /\b$seed\|uniform\|1\d\d\d\|2/,
 	"psql seeded_random count uniform");
@@ -704,7 +689,7 @@ ok($out =~ /\b$seed\|zipfian\|4\d\d\d\|2/,
 $node->safe_psql('postgres', 'DROP TABLE seeded_random;');
 
 # backslash commands
-pgbench(
+$node->pgbench(
 	'-t 1', 0,
 	[
 		qr{type: .*/001_pgbench_backslash_commands},
@@ -733,7 +718,7 @@ pgbench(
 	});
 
 # working \gset
-pgbench(
+$node->pgbench(
 	'-t 1', 0,
 	[ qr{type: .*/001_pgbench_gset}, qr{processed: 1/1} ],
 	[
@@ -768,7 +753,7 @@ SELECT 0 AS i4, 4 AS i4 \gset
 }
 	});
 # \gset cannot accept more than one row, causing command to fail.
-pgbench(
+$node->pgbench(
 	'-t 1', 2,
 	[ qr{type: .*/001_pgbench_gset_two_rows}, qr{processed: 0/1} ],
 	[qr{expected one row, got 2\b}],
@@ -781,10 +766,10 @@ SELECT 5432 AS fail UNION SELECT 5433 ORDER BY 1 \gset
 
 # working \aset
 # Valid cases.
-pgbench(
+$node->pgbench(
 	'-t 1', 0,
 	[ qr{type: .*/001_pgbench_aset}, qr{processed: 1/1} ],
-	[ qr{command=3.: int 8\b},       qr{command=4.: int 7\b} ],
+	[ qr{command=3.: int 8\b}, qr{command=4.: int 7\b} ],
 	'pgbench aset command',
 	{
 		'001_pgbench_aset' => q{
@@ -797,7 +782,7 @@ SELECT 8 AS i6 UNION SELECT 9 ORDER BY 1 DESC \aset
 }
 	});
 # Empty result set with \aset, causing command to fail.
-pgbench(
+$node->pgbench(
 	'-t 1', 2,
 	[ qr{type: .*/001_pgbench_aset_empty}, qr{processed: 0/1} ],
 	[
@@ -814,7 +799,7 @@ pgbench(
 	});
 
 # Working \startpipeline
-pgbench(
+$node->pgbench(
 	'-t 1 -n -M extended',
 	0,
 	[ qr{type: .*/001_pgbench_pipeline}, qr{actually processed: 1/1} ],
@@ -830,7 +815,7 @@ pgbench(
 	});
 
 # Working \startpipeline in prepared query mode
-pgbench(
+$node->pgbench(
 	'-t 1 -n -M prepared',
 	0,
 	[ qr{type: .*/001_pgbench_pipeline_prep}, qr{actually processed: 1/1} ],
@@ -840,13 +825,15 @@ pgbench(
 		'001_pgbench_pipeline_prep' => q{
 -- test startpipeline
 \startpipeline
+\endpipeline
+\startpipeline
 } . "select 1;\n" x 10 . q{
 \endpipeline
 }
 	});
 
 # Try \startpipeline twice
-pgbench(
+$node->pgbench(
 	'-t 1 -n -M extended',
 	2,
 	[],
@@ -861,7 +848,7 @@ pgbench(
 	});
 
 # Try to end a pipeline that hasn't started
-pgbench(
+$node->pgbench(
 	'-t 1 -n -M extended',
 	2,
 	[],
@@ -875,7 +862,7 @@ pgbench(
 	});
 
 # Try \gset in pipeline mode
-pgbench(
+$node->pgbench(
 	'-t 1 -n -M extended',
 	2,
 	[],
@@ -889,6 +876,26 @@ select 1 \gset f
 }
 	});
 
+# Working \startpipeline in prepared query mode with serializable
+$node->pgbench(
+	'-c4 -j2 -t 10 -n -M prepared',
+	0,
+	[
+		qr{type: .*/001_pgbench_pipeline_serializable},
+		qr{actually processed: (\d+)/\1}
+	],
+	[],
+	'working \startpipeline with serializable',
+	{
+		'001_pgbench_pipeline_serializable' => q{
+-- test startpipeline with serializable
+\startpipeline
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+} . "select 1;\n" x 10 . q{
+END;
+\endpipeline
+}
+	});
 
 # trigger many expression errors
 my @errors = (
@@ -916,7 +923,7 @@ SELECT LEAST(} . join(', ', (':i') x 256) . q{)}
 
 	# SHELL
 	[
-		'shell bad command',                    2,
+		'shell bad command', 2,
 		[qr{\(shell\) .* meta-command failed}], q{\shell no-such-command}
 	],
 	[
@@ -935,11 +942,11 @@ SELECT LEAST(} . join(', ', (':i') x 256) . q{)}
 
 	# SET
 	[
-		'set syntax error',                  1,
+		'set syntax error', 1,
 		[qr{syntax error in command "set"}], q{\set i 1 +}
 	],
 	[
-		'set no such function',         1,
+		'set no such function', 1,
 		[qr{unexpected function name}], q{\set i noSuchFunction()}
 	],
 	[
@@ -961,11 +968,11 @@ SELECT LEAST(} . join(', ', (':i') x 256) . q{)}
 		q{\set i least(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16)}
 	],
 	[
-		'set empty random range',          2,
+		'set empty random range', 2,
 		[qr{empty range given to random}], q{\set i random(5,3)}
 	],
 	[
-		'set random range too large',    2,
+		'set random range too large', 2,
 		[qr{random range is too large}], q{\set i random(:minint, :maxint)}
 	],
 	[
@@ -993,21 +1000,21 @@ SELECT LEAST(} . join(', ', (':i') x 256) . q{)}
 		q{\set i random_zipfian(0, 10, 1000000)}
 	],
 	[
-		'set non numeric value',                     2,
+		'set non numeric value', 2,
 		[qr{malformed variable "foo" value: "bla"}], q{\set i :foo + 1}
 	],
-	[ 'set no expression',    1, [qr{syntax error}],      q{\set i} ],
+	[ 'set no expression', 1, [qr{syntax error}], q{\set i} ],
 	[ 'set missing argument', 1, [qr{missing argument}i], q{\set} ],
 	[
-		'set not a bool',                      2,
+		'set not a bool', 2,
 		[qr{cannot coerce double to boolean}], q{\set b NOT 0.0}
 	],
 	[
-		'set not an int',                   2,
+		'set not an int', 2,
 		[qr{cannot coerce boolean to int}], q{\set i TRUE + 2}
 	],
 	[
-		'set not a double',                    2,
+		'set not a double', 2,
 		[qr{cannot coerce boolean to double}], q{\set d ln(TRUE)}
 	],
 	[
@@ -1017,26 +1024,26 @@ SELECT LEAST(} . join(', ', (':i') x 256) . q{)}
 		q{\set i CASE TRUE THEN 1 ELSE 0 END}
 	],
 	[
-		'set random error',                 2,
+		'set random error', 2,
 		[qr{cannot coerce boolean to int}], q{\set b random(FALSE, TRUE)}
 	],
 	[
-		'set number of args mismatch',        1,
+		'set number of args mismatch', 1,
 		[qr{unexpected number of arguments}], q{\set d ln(1.0, 2.0))}
 	],
 	[
-		'set at least one arg',               1,
+		'set at least one arg', 1,
 		[qr{at least one argument expected}], q{\set i greatest())}
 	],
 
 	# SET: ARITHMETIC OVERFLOW DETECTION
 	[
-		'set double to int overflow',         2,
+		'set double to int overflow', 2,
 		[qr{double to int overflow for 100}], q{\set i int(1E32)}
 	],
 	[
 		'set bigint add overflow', 2,
-		[qr{int add out}],         q{\set i (1<<62) + (1<<62)}
+		[qr{int add out}], q{\set i (1<<62) + (1<<62)}
 	],
 	[
 		'set bigint sub overflow',
@@ -1053,22 +1060,22 @@ SELECT LEAST(} . join(', ', (':i') x 256) . q{)}
 
 	# SETSHELL
 	[
-		'setshell not an int',                2,
+		'setshell not an int', 2,
 		[qr{command must return an integer}], q{\setshell i echo -n one}
 	],
 	[ 'setshell missing arg', 1, [qr{missing argument }], q{\setshell var} ],
 	[
-		'setshell no such command',   2,
+		'setshell no such command', 2,
 		[qr{could not read result }], q{\setshell var no-such-command}
 	],
 
 	# SLEEP
 	[
-		'sleep undefined variable',      2,
+		'sleep undefined variable', 2,
 		[qr{sleep: undefined variable}], q{\sleep :nosuchvariable}
 	],
 	[
-		'sleep too many args',    1,
+		'sleep too many args', 1,
 		[qr{too many arguments}], q{\sleep too many args}
 	],
 	[
@@ -1076,18 +1083,18 @@ SELECT LEAST(} . join(', ', (':i') x 256) . q{)}
 		[ qr{missing argument}, qr{\\sleep} ], q{\sleep}
 	],
 	[
-		'sleep unknown unit',         1,
+		'sleep unknown unit', 1,
 		[qr{unrecognized time unit}], q{\sleep 1 week}
 	],
 
 	# MISC
 	[
-		'misc invalid backslash command',         1,
+		'misc invalid backslash command', 1,
 		[qr{invalid command .* "nosuchcommand"}], q{\nosuchcommand}
 	],
 	[ 'misc empty script', 1, [qr{empty command list for script}], q{} ],
 	[
-		'bad boolean',                     2,
+		'bad boolean', 2,
 		[qr{malformed variable.*trueXXX}], q{\set b :badtrue or true}
 	],
 	[
@@ -1099,22 +1106,22 @@ SELECT LEAST(} . join(', ', (':i') x 256) . q{)}
 
 	# GSET
 	[
-		'gset no row',                   2,
+		'gset no row', 2,
 		[qr{expected one row, got 0\b}], q{SELECT WHERE FALSE \gset}
 	],
-	[ 'gset alone', 1, [qr{gset must follow a SQL command}], q{\gset} ],
+	[ 'gset alone', 1, [qr{gset must follow an SQL command}], q{\gset} ],
 	[
-		'gset no SQL',                        1,
-		[qr{gset must follow a SQL command}], q{\set i +1
+		'gset no SQL', 1,
+		[qr{gset must follow an SQL command}], q{\set i +1
 \gset}
 	],
 	[
 		'gset too many arguments', 1,
-		[qr{too many arguments}],  q{SELECT 1 \gset a b}
+		[qr{too many arguments}], q{SELECT 1 \gset a b}
 	],
 	[
-		'gset after gset',                    1,
-		[qr{gset must follow a SQL command}], q{SELECT 1 AS i \gset
+		'gset after gset', 1,
+		[qr{gset must follow an SQL command}], q{SELECT 1 AS i \gset
 \gset}
 	],
 	[
@@ -1124,7 +1131,7 @@ SELECT LEAST(} . join(', ', (':i') x 256) . q{)}
 		q{DROP TABLE IF EXISTS no_such_table \gset}
 	],
 	[
-		'gset bad default name',                      2,
+		'gset bad default name', 2,
 		[qr{error storing into variable \?column\?}], q{SELECT 1 \gset}
 	],
 	[
@@ -1140,7 +1147,7 @@ for my $e (@errors)
 	$status != 0 or die "invalid expected status for test \"$name\"";
 	my $n = '001_pgbench_error_' . $name;
 	$n =~ s/ /_/g;
-	pgbench(
+	$node->pgbench(
 		'-n -t 1 -Dfoo=bla -Dnull=null -Dtrue=true -Done=1 -Dzero=0.0 -Dbadtrue=trueXXX'
 		  . ' -Dmaxint=9223372036854775807 -Dminint=-9223372036854775808'
 		  . ($no_prepare ? '' : ' -M prepared'),
@@ -1152,14 +1159,14 @@ for my $e (@errors)
 }
 
 # throttling
-pgbench(
+$node->pgbench(
 	'-t 100 -S --rate=100000 --latency-limit=1000000 -c 2 -n -r',
 	0,
 	[ qr{processed: 200/200}, qr{builtin: select only} ],
 	[qr{^$}],
 	'pgbench throttling');
 
-pgbench(
+$node->pgbench(
 
 	# given the expected rate and the 2 ms tx duration, at most one is executed
 	'-t 10 --rate=100000 --latency-limit=1 -n -r',
@@ -1184,7 +1191,12 @@ sub list_files
 	return map { $dir . '/' . $_ } @files;
 }
 
-# check log contents and cleanup
+# Check log contents and clean them up:
+#   $dir: directory holding logs
+#   $prefix: file prefix for per-thread logs
+#   $nb: number of expected files
+#   $min/$max: minimum and maximum number of lines in log files
+#   $re: regular expression each log line has to match
 sub check_pgbench_logs
 {
 	local $Test::Builder::Level = $Test::Builder::Level + 1;
@@ -1199,42 +1211,296 @@ sub check_pgbench_logs
 	my $log_number = 0;
 	for my $log (sort @logs)
 	{
-		eval {
-			open my $fh, '<', $log or die "$@";
-			my @contents = <$fh>;
-			my $clen     = @contents;
-			ok( $min <= $clen && $clen <= $max,
-				"transaction count for $log ($clen)");
-			ok( grep($re, @contents) == $clen,
-				"transaction format for $prefix");
-			close $fh or die "$@";
-		};
+		# Check the contents of each log file.
+		my $contents_raw = slurp_file($log);
+
+		my @contents = split(/\n/, $contents_raw);
+		my $clen = @contents;
+		ok( $min <= $clen && $clen <= $max,
+			"transaction count for $log ($clen)");
+		my $clen_match = grep(/$re/, @contents);
+		ok($clen_match == $clen, "transaction format for $prefix");
+
+		# Show more information if some logs don't match
+		# to help with debugging.
+		if ($clen_match != $clen)
+		{
+			foreach my $log (@contents)
+			{
+				print "# Log entry not matching: $log\n"
+				  unless $log =~ /$re/;
+			}
+		}
 	}
-	ok(unlink(@logs), "remove log files");
 	return;
 }
 
 my $bdir = $node->basedir;
 
-# with sampling rate
-pgbench(
+# Run with sampling rate, 2 clients with 50 transactions each.
+$node->pgbench(
 	"-n -S -t 50 -c 2 --log --sampling-rate=0.5", 0,
 	[ qr{select only}, qr{processed: 100/100} ], [qr{^$}],
 	'pgbench logs', undef,
 	"--log-prefix=$bdir/001_pgbench_log_2");
-
+# The IDs of the clients (1st field) in the logs should be either 0 or 1.
 check_pgbench_logs($bdir, '001_pgbench_log_2', 1, 8, 92,
-	qr{^0 \d{1,2} \d+ \d \d+ \d+$});
+	qr{^[01] \d{1,2} \d+ \d \d+ \d+$});
 
-# check log file in some detail
-pgbench(
-	"-n -b se -t 10 -l", 0,
+# Run with different read-only option pattern, 1 client with 10 transactions.
+$node->pgbench(
+	"-n -b select-only -t 10 -l", 0,
 	[ qr{select only}, qr{processed: 10/10} ], [qr{^$}],
 	'pgbench logs contents', undef,
 	"--log-prefix=$bdir/001_pgbench_log_3");
-
+# The ID of a single client (1st field) should match 0.
 check_pgbench_logs($bdir, '001_pgbench_log_3', 1, 10, 10,
-	qr{^\d \d{1,2} \d+ \d \d+ \d+$});
+	qr{^0 \d{1,2} \d+ \d \d+ \d+$});
+
+# abortion of the client if the script contains an incomplete transaction block
+$node->pgbench(
+	'--no-vacuum',
+	2,
+	[qr{processed: 1/10}],
+	[
+		qr{client 0 aborted: end of script reached without completing the last transaction}
+	],
+	'incomplete transaction block',
+	{ '001_pgbench_incomplete_transaction_block' => q{BEGIN;SELECT 1;} });
+
+# Test the concurrent update in the table row and deadlocks.
+
+$node->safe_psql('postgres',
+		'CREATE UNLOGGED TABLE first_client_table (value integer); '
+	  . 'CREATE UNLOGGED TABLE xy (x integer, y integer); '
+	  . 'INSERT INTO xy VALUES (1, 2);');
+
+# Serialization error and retry
+
+local $ENV{PGOPTIONS} = "-c default_transaction_isolation=repeatable\\ read";
+
+# Check that we have a serialization error and the same random value of the
+# delta variable in the next try
+my $err_pattern =
+	"(client (0|1) sending UPDATE xy SET y = y \\+ -?\\d+\\b).*"
+  . "client \\2 got an error in command 3 \\(SQL\\) of script 0; "
+  . "ERROR:  could not serialize access due to concurrent update\\b.*"
+  . "\\1";
+
+$node->pgbench(
+	"-n -c 2 -t 1 -d --verbose-errors --max-tries 2",
+	0,
+	[
+		qr{processed: 2/2\b},
+		qr{number of transactions retried: 1\b},
+		qr{total number of retries: 1\b}
+	],
+	[qr/$err_pattern/s],
+	'concurrent update with retrying',
+	{
+		'001_pgbench_serialization' => q{
+-- What's happening:
+-- The first client starts the transaction with the isolation level Repeatable
+-- Read:
+--
+-- BEGIN;
+-- UPDATE xy SET y = ... WHERE x = 1;
+--
+-- The second client starts a similar transaction with the same isolation level:
+--
+-- BEGIN;
+-- UPDATE xy SET y = ... WHERE x = 1;
+-- <waiting for the first client>
+--
+-- The first client commits its transaction, and the second client gets a
+-- serialization error.
+
+\set delta random(-5000, 5000)
+
+-- The second client will stop here
+SELECT pg_advisory_lock(0);
+
+-- Start transaction with concurrent update
+BEGIN;
+UPDATE xy SET y = y + :delta WHERE x = 1 AND pg_advisory_lock(1) IS NOT NULL;
+
+-- Wait for the second client
+DO $$
+DECLARE
+  exists boolean;
+  waiters integer;
+BEGIN
+  -- The second client always comes in second, and the number of rows in the
+  -- table first_client_table reflect this. Here the first client inserts a row,
+  -- so the second client will see a non-empty table when repeating the
+  -- transaction after the serialization error.
+  SELECT EXISTS (SELECT * FROM first_client_table) INTO STRICT exists;
+  IF NOT exists THEN
+	-- Let the second client begin
+	PERFORM pg_advisory_unlock(0);
+	-- And wait until the second client tries to get the same lock
+	LOOP
+	  SELECT COUNT(*) INTO STRICT waiters FROM pg_locks WHERE
+	  locktype = 'advisory' AND objsubid = 1 AND
+	  ((classid::bigint << 32) | objid::bigint = 1::bigint) AND NOT granted;
+	  IF waiters = 1 THEN
+		INSERT INTO first_client_table VALUES (1);
+
+		-- Exit loop
+		EXIT;
+	  END IF;
+	END LOOP;
+  END IF;
+END$$;
+
+COMMIT;
+SELECT pg_advisory_unlock_all();
+}
+	});
+
+# Clean up
+
+$node->safe_psql('postgres', 'DELETE FROM first_client_table;');
+
+local $ENV{PGOPTIONS} = "-c default_transaction_isolation=read\\ committed";
+
+# Deadlock error and retry
+
+# Check that we have a deadlock error
+$err_pattern =
+	"client (0|1) got an error in command (3|5) \\(SQL\\) of script 0; "
+  . "ERROR:  deadlock detected\\b";
+
+$node->pgbench(
+	"-n -c 2 -t 1 --max-tries 2 --verbose-errors",
+	0,
+	[
+		qr{processed: 2/2\b},
+		qr{number of transactions retried: 1\b},
+		qr{total number of retries: 1\b}
+	],
+	[qr{$err_pattern}],
+	'deadlock with retrying',
+	{
+		'001_pgbench_deadlock' => q{
+-- What's happening:
+-- The first client gets the lock 2.
+-- The second client gets the lock 3 and tries to get the lock 2.
+-- The first client tries to get the lock 3 and one of them gets a deadlock
+-- error.
+--
+-- A client that does not get a deadlock error must hold a lock at the
+-- transaction start. Thus in the end it releases all of its locks before the
+-- client with the deadlock error starts a retry (we do not want any errors
+-- again).
+
+-- Since the client with the deadlock error has not released the blocking locks,
+-- let's do this here.
+SELECT pg_advisory_unlock_all();
+
+-- The second client and the client with the deadlock error stop here
+SELECT pg_advisory_lock(0);
+SELECT pg_advisory_lock(1);
+
+-- The second client and the client with the deadlock error always come after
+-- the first and the number of rows in the table first_client_table reflects
+-- this. Here the first client inserts a row, so in the future the table is
+-- always non-empty.
+DO $$
+DECLARE
+  exists boolean;
+BEGIN
+  SELECT EXISTS (SELECT * FROM first_client_table) INTO STRICT exists;
+  IF exists THEN
+	-- We are the second client or the client with the deadlock error
+
+	-- The first client will take care by itself of this lock (see below)
+	PERFORM pg_advisory_unlock(0);
+
+	PERFORM pg_advisory_lock(3);
+
+	-- The second client can get a deadlock here
+	PERFORM pg_advisory_lock(2);
+  ELSE
+	-- We are the first client
+
+	-- This code should not be used in a new transaction after an error
+	INSERT INTO first_client_table VALUES (1);
+
+	PERFORM pg_advisory_lock(2);
+  END IF;
+END$$;
+
+DO $$
+DECLARE
+  num_rows integer;
+  waiters integer;
+BEGIN
+  -- Check if we are the first client
+  SELECT COUNT(*) FROM first_client_table INTO STRICT num_rows;
+  IF num_rows = 1 THEN
+	-- This code should not be used in a new transaction after an error
+	INSERT INTO first_client_table VALUES (2);
+
+	-- Let the second client begin
+	PERFORM pg_advisory_unlock(0);
+	PERFORM pg_advisory_unlock(1);
+
+	-- Make sure the second client is ready for deadlock
+	LOOP
+	  SELECT COUNT(*) INTO STRICT waiters FROM pg_locks WHERE
+	  locktype = 'advisory' AND
+	  objsubid = 1 AND
+	  ((classid::bigint << 32) | objid::bigint = 2::bigint) AND
+	  NOT granted;
+
+	  IF waiters = 1 THEN
+	    -- Exit loop
+		EXIT;
+	  END IF;
+	END LOOP;
+
+	PERFORM pg_advisory_lock(0);
+    -- And the second client took care by itself of the lock 1
+  END IF;
+END$$;
+
+-- The first client can get a deadlock here
+SELECT pg_advisory_lock(3);
+
+SELECT pg_advisory_unlock_all();
+}
+	});
+
+# Clean up
+$node->safe_psql('postgres', 'DROP TABLE first_client_table, xy;');
+
+# Test --exit-on-abort
+$node->safe_psql('postgres',
+	'CREATE TABLE counter(i int); '.
+	'INSERT INTO counter VALUES (0);'
+);
+
+$node->pgbench(
+	'-t 10 -c 2 -j 2 --exit-on-abort',
+	2,
+	[],
+	[
+		qr{division by zero},
+		qr{Run was aborted due to an error in thread}
+	],
+	'test --exit-on-abort',
+	{
+		'001_exit_on_abort' => q{
+update counter set i = i+1 returning i \gset
+\if :i = 5
+\set y 1/0
+\endif
+}
+	});
+
+# Clean up
+$node->safe_psql('postgres', 'DROP TABLE counter;');
 
 # done
 $node->safe_psql('postgres', 'DROP TABLESPACE regress_pgbench_tap_1_ts');

@@ -48,7 +48,7 @@ SELECT pg_column_compression(f1) FROM cmmove2;
 
 -- test externally stored compressed data
 CREATE OR REPLACE FUNCTION large_val() RETURNS TEXT LANGUAGE SQL AS
-'select array_agg(md5(g::text))::text from generate_series(1, 256) g';
+'select array_agg(fipshash(g::text))::text from generate_series(1, 256) g';
 CREATE TABLE cmdata2 (f1 text COMPRESSION pglz);
 INSERT INTO cmdata2 SELECT large_val() || repeat('a', 4000);
 SELECT pg_column_compression(f1) FROM cmdata2;
@@ -69,6 +69,7 @@ ALTER TABLE cmdata2 ALTER COLUMN f1 TYPE int USING f1::integer;
 --changing column storage should not impact the compression method
 --but the data should not be compressed
 ALTER TABLE cmdata2 ALTER COLUMN f1 TYPE varchar;
+ALTER TABLE cmdata2 ALTER COLUMN f1 SET COMPRESSION pglz;
 \d+ cmdata2
 ALTER TABLE cmdata2 ALTER COLUMN f1 SET STORAGE plain;
 \d+ cmdata2
@@ -76,10 +77,10 @@ INSERT INTO cmdata2 VALUES (repeat('123456789', 800));
 SELECT pg_column_compression(f1) FROM cmdata2;
 
 -- test compression with materialized view
-CREATE MATERIALIZED VIEW mv(x) AS SELECT * FROM cmdata1;
-\d+ mv
+CREATE MATERIALIZED VIEW compressmv(x) AS SELECT * FROM cmdata1;
+\d+ compressmv
 SELECT pg_column_compression(f1) FROM cmdata1;
-SELECT pg_column_compression(x) FROM mv;
+SELECT pg_column_compression(x) FROM compressmv;
 
 -- test compression with partition
 CREATE TABLE cmpart(f1 text COMPRESSION lz4) PARTITION BY HASH(f1);
@@ -92,7 +93,7 @@ INSERT INTO cmpart VALUES (repeat('123456789', 4004));
 SELECT pg_column_compression(f1) FROM cmpart1;
 SELECT pg_column_compression(f1) FROM cmpart2;
 
--- test compression with inheritence, error
+-- test compression with inheritance, error
 CREATE TABLE cminh() INHERITS(cmdata, cmdata1);
 CREATE TABLE cminh(f1 TEXT COMPRESSION lz4) INHERITS(cmdata);
 
@@ -100,9 +101,6 @@ CREATE TABLE cminh(f1 TEXT COMPRESSION lz4) INHERITS(cmdata);
 SET default_toast_compression = '';
 SET default_toast_compression = 'I do not exist compression';
 SET default_toast_compression = 'lz4';
-DROP TABLE cmdata2;
-CREATE TABLE cmdata2 (f1 text);
-\d+ cmdata2
 SET default_toast_compression = 'pglz';
 
 -- test alter compression method
@@ -111,11 +109,14 @@ INSERT INTO cmdata VALUES (repeat('123456789', 4004));
 \d+ cmdata
 SELECT pg_column_compression(f1) FROM cmdata;
 
--- test alter compression method for the materialized view
-ALTER MATERIALIZED VIEW mv ALTER COLUMN x SET COMPRESSION lz4;
-\d+ mv
+ALTER TABLE cmdata2 ALTER COLUMN f1 SET COMPRESSION default;
+\d+ cmdata2
 
--- test alter compression method for the partitioned table
+-- test alter compression method for materialized views
+ALTER MATERIALIZED VIEW compressmv ALTER COLUMN x SET COMPRESSION lz4;
+\d+ compressmv
+
+-- test alter compression method for partitioned tables
 ALTER TABLE cmpart1 ALTER COLUMN f1 SET COMPRESSION pglz;
 ALTER TABLE cmpart2 ALTER COLUMN f1 SET COMPRESSION lz4;
 
@@ -125,7 +126,7 @@ INSERT INTO cmpart VALUES (repeat('123456789', 4004));
 SELECT pg_column_compression(f1) FROM cmpart1;
 SELECT pg_column_compression(f1) FROM cmpart2;
 
---vacuum full to recompress the data
+-- VACUUM FULL does not recompress
 SELECT pg_column_compression(f1) FROM cmdata;
 VACUUM FULL cmdata;
 SELECT pg_column_compression(f1) FROM cmdata;
@@ -134,7 +135,7 @@ SELECT pg_column_compression(f1) FROM cmdata;
 DROP TABLE cmdata2;
 CREATE TABLE cmdata2 (f1 TEXT COMPRESSION pglz, f2 TEXT COMPRESSION lz4);
 CREATE UNIQUE INDEX idx1 ON cmdata2 ((f1 || f2));
-INSERT INTO cmdata2 VALUES((SELECT array_agg(md5(g::TEXT))::TEXT FROM
+INSERT INTO cmdata2 VALUES((SELECT array_agg(fipshash(g::TEXT))::TEXT FROM
 generate_series(1, 50) g), VERSION());
 
 -- check data is ok

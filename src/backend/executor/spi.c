@@ -3,7 +3,7 @@
  * spi.c
  *				Server Programming Interface
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -64,12 +64,9 @@ static void _SPI_prepare_plan(const char *src, SPIPlanPtr plan);
 
 static void _SPI_prepare_oneshot_plan(const char *src, SPIPlanPtr plan);
 
-static int	_SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
+static int	_SPI_execute_plan(SPIPlanPtr plan, const SPIExecuteOptions *options,
 							  Snapshot snapshot, Snapshot crosscheck_snapshot,
-							  bool read_only, bool no_snapshots,
-							  bool fire_triggers, uint64 tcount,
-							  DestReceiver *caller_dest,
-							  ResourceOwner plan_owner);
+							  bool fire_triggers);
 
 static ParamListInfo _SPI_convert_params(int nargs, Oid *argtypes,
 										 Datum *Values, const char *Nulls);
@@ -159,7 +156,8 @@ SPI_connect_ext(int options)
 	 * XXX It could be better to use PortalContext as the parent context in
 	 * all cases, but we may not be inside a portal (consider deferred-trigger
 	 * execution).  Perhaps CurTransactionContext could be an option?  For now
-	 * it doesn't matter because we clean up explicitly in AtEOSubXact_SPI().
+	 * it doesn't matter because we clean up explicitly in AtEOSubXact_SPI();
+	 * but see also AtEOXact_SPI().
 	 */
 	_SPI_current->procCxt = AllocSetContextCreate(_SPI_current->atomic ? TopTransactionContext : PortalContext,
 												  "SPI Proc",
@@ -217,20 +215,27 @@ SPI_finish(void)
 	return SPI_OK_FINISH;
 }
 
+/*
+ * SPI_start_transaction is a no-op, kept for backwards compatibility.
+ * SPI callers are *always* inside a transaction.
+ */
 void
 SPI_start_transaction(void)
 {
-	MemoryContext oldcontext = CurrentMemoryContext;
-
-	StartTransactionCommand();
-	MemoryContextSwitchTo(oldcontext);
 }
 
 static void
 _SPI_commit(bool chain)
 {
 	MemoryContext oldcontext = CurrentMemoryContext;
+	SavedTransactionCharacteristics savetc;
 
+	/*
+	 * Complain if we are in a context that doesn't permit transaction
+	 * termination.  (Note: here and _SPI_rollback should be the only places
+	 * that throw ERRCODE_INVALID_TRANSACTION_TERMINATION, so that callers can
+	 * test for that with security that they know what happened.)
+	 */
 	if (_SPI_current->atomic)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TRANSACTION_TERMINATION),
@@ -243,44 +248,73 @@ _SPI_commit(bool chain)
 	 * top-level transaction in such a block violates that idea.  A future PL
 	 * implementation might have different ideas about this, in which case
 	 * this restriction would have to be refined or the check possibly be
-	 * moved out of SPI into the PLs.
+	 * moved out of SPI into the PLs.  Note however that the code below relies
+	 * on not being within a subtransaction.
 	 */
 	if (IsSubTransaction())
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TRANSACTION_TERMINATION),
 				 errmsg("cannot commit while a subtransaction is active")));
 
-	/*
-	 * Hold any pinned portals that any PLs might be using.  We have to do
-	 * this before changing transaction state, since this will run
-	 * user-defined code that might throw an error.
-	 */
-	HoldPinnedPortals();
-
-	/* Start the actual commit */
-	_SPI_current->internal_xact = true;
-
-	/*
-	 * Before committing, pop all active snapshots to avoid error about
-	 * "snapshot %p still active".
-	 */
-	while (ActiveSnapshotSet())
-		PopActiveSnapshot();
-
 	if (chain)
-		SaveTransactionCharacteristics();
+		SaveTransactionCharacteristics(&savetc);
 
-	CommitTransactionCommand();
-
-	if (chain)
+	/* Catch any error occurring during the COMMIT */
+	PG_TRY();
 	{
+		/* Protect current SPI stack entry against deletion */
+		_SPI_current->internal_xact = true;
+
+		/*
+		 * Hold any pinned portals that any PLs might be using.  We have to do
+		 * this before changing transaction state, since this will run
+		 * user-defined code that might throw an error.
+		 */
+		HoldPinnedPortals();
+
+		/* Release snapshots associated with portals */
+		ForgetPortalSnapshots();
+
+		/* Do the deed */
+		CommitTransactionCommand();
+
+		/* Immediately start a new transaction */
 		StartTransactionCommand();
-		RestoreTransactionCharacteristics();
+		if (chain)
+			RestoreTransactionCharacteristics(&savetc);
+
+		MemoryContextSwitchTo(oldcontext);
+
+		_SPI_current->internal_xact = false;
 	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
 
-	MemoryContextSwitchTo(oldcontext);
+		/* Save error info in caller's context */
+		MemoryContextSwitchTo(oldcontext);
+		edata = CopyErrorData();
+		FlushErrorState();
 
-	_SPI_current->internal_xact = false;
+		/*
+		 * Abort the failed transaction.  If this fails too, we'll just
+		 * propagate the error out ... there's not that much we can do.
+		 */
+		AbortCurrentTransaction();
+
+		/* ... and start a new one */
+		StartTransactionCommand();
+		if (chain)
+			RestoreTransactionCharacteristics(&savetc);
+
+		MemoryContextSwitchTo(oldcontext);
+
+		_SPI_current->internal_xact = false;
+
+		/* Now that we've cleaned up the transaction, re-throw the error */
+		ReThrowError(edata);
+	}
+	PG_END_TRY();
 }
 
 void
@@ -299,7 +333,9 @@ static void
 _SPI_rollback(bool chain)
 {
 	MemoryContext oldcontext = CurrentMemoryContext;
+	SavedTransactionCharacteristics savetc;
 
+	/* see under SPI_commit() */
 	if (_SPI_current->atomic)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TRANSACTION_TERMINATION),
@@ -311,31 +347,67 @@ _SPI_rollback(bool chain)
 				(errcode(ERRCODE_INVALID_TRANSACTION_TERMINATION),
 				 errmsg("cannot roll back while a subtransaction is active")));
 
-	/*
-	 * Hold any pinned portals that any PLs might be using.  We have to do
-	 * this before changing transaction state, since this will run
-	 * user-defined code that might throw an error, and in any case couldn't
-	 * be run in an already-aborted transaction.
-	 */
-	HoldPinnedPortals();
-
-	/* Start the actual rollback */
-	_SPI_current->internal_xact = true;
-
 	if (chain)
-		SaveTransactionCharacteristics();
+		SaveTransactionCharacteristics(&savetc);
 
-	AbortCurrentTransaction();
-
-	if (chain)
+	/* Catch any error occurring during the ROLLBACK */
+	PG_TRY();
 	{
+		/* Protect current SPI stack entry against deletion */
+		_SPI_current->internal_xact = true;
+
+		/*
+		 * Hold any pinned portals that any PLs might be using.  We have to do
+		 * this before changing transaction state, since this will run
+		 * user-defined code that might throw an error, and in any case
+		 * couldn't be run in an already-aborted transaction.
+		 */
+		HoldPinnedPortals();
+
+		/* Release snapshots associated with portals */
+		ForgetPortalSnapshots();
+
+		/* Do the deed */
+		AbortCurrentTransaction();
+
+		/* Immediately start a new transaction */
 		StartTransactionCommand();
-		RestoreTransactionCharacteristics();
+		if (chain)
+			RestoreTransactionCharacteristics(&savetc);
+
+		MemoryContextSwitchTo(oldcontext);
+
+		_SPI_current->internal_xact = false;
 	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
 
-	MemoryContextSwitchTo(oldcontext);
+		/* Save error info in caller's context */
+		MemoryContextSwitchTo(oldcontext);
+		edata = CopyErrorData();
+		FlushErrorState();
 
-	_SPI_current->internal_xact = false;
+		/*
+		 * Try again to abort the failed transaction.  If this fails too,
+		 * we'll just propagate the error out ... there's not that much we can
+		 * do.
+		 */
+		AbortCurrentTransaction();
+
+		/* ... and start a new one */
+		StartTransactionCommand();
+		if (chain)
+			RestoreTransactionCharacteristics(&savetc);
+
+		MemoryContextSwitchTo(oldcontext);
+
+		_SPI_current->internal_xact = false;
+
+		/* Now that we've cleaned up the transaction, re-throw the error */
+		ReThrowError(edata);
+	}
+	PG_END_TRY();
 }
 
 void
@@ -351,37 +423,54 @@ SPI_rollback_and_chain(void)
 }
 
 /*
- * Clean up SPI state.  Called on transaction end (of non-SPI-internal
- * transactions) and when returning to the main loop on error.
- */
-void
-SPICleanup(void)
-{
-	_SPI_current = NULL;
-	_SPI_connected = -1;
-	/* Reset API global variables, too */
-	SPI_processed = 0;
-	SPI_tuptable = NULL;
-	SPI_result = 0;
-}
-
-/*
  * Clean up SPI state at transaction commit or abort.
  */
 void
 AtEOXact_SPI(bool isCommit)
 {
-	/* Do nothing if the transaction end was initiated by SPI. */
-	if (_SPI_current && _SPI_current->internal_xact)
-		return;
+	bool		found = false;
 
-	if (isCommit && _SPI_connected != -1)
+	/*
+	 * Pop stack entries, stopping if we find one marked internal_xact (that
+	 * one belongs to the caller of SPI_commit or SPI_rollback).
+	 */
+	while (_SPI_connected >= 0)
+	{
+		_SPI_connection *connection = &(_SPI_stack[_SPI_connected]);
+
+		if (connection->internal_xact)
+			break;
+
+		found = true;
+
+		/*
+		 * We need not release the procedure's memory contexts explicitly, as
+		 * they'll go away automatically when their parent context does; see
+		 * notes in SPI_connect_ext.
+		 */
+
+		/*
+		 * Restore outer global variables and pop the stack entry.  Unlike
+		 * SPI_finish(), we don't risk switching to memory contexts that might
+		 * be already gone.
+		 */
+		SPI_processed = connection->outer_processed;
+		SPI_tuptable = connection->outer_tuptable;
+		SPI_result = connection->outer_result;
+
+		_SPI_connected--;
+		if (_SPI_connected < 0)
+			_SPI_current = NULL;
+		else
+			_SPI_current = &(_SPI_stack[_SPI_connected]);
+	}
+
+	/* We should only find entries to pop during an ABORT. */
+	if (found && isCommit)
 		ereport(WARNING,
 				(errcode(ERRCODE_WARNING),
 				 errmsg("transaction left non-empty SPI stack"),
 				 errhint("Check for missing \"SPI_finish\" calls.")));
-
-	SPICleanup();
 }
 
 /*
@@ -505,6 +594,7 @@ int
 SPI_execute(const char *src, bool read_only, long tcount)
 {
 	_SPI_plan	plan;
+	SPIExecuteOptions options;
 	int			res;
 
 	if (src == NULL || tcount < 0)
@@ -521,11 +611,13 @@ SPI_execute(const char *src, bool read_only, long tcount)
 
 	_SPI_prepare_oneshot_plan(src, &plan);
 
-	res = _SPI_execute_plan(&plan, NULL,
+	memset(&options, 0, sizeof(options));
+	options.read_only = read_only;
+	options.tcount = tcount;
+
+	res = _SPI_execute_plan(&plan, &options,
 							InvalidSnapshot, InvalidSnapshot,
-							read_only, false,
-							true, tcount,
-							NULL, NULL);
+							true);
 
 	_SPI_end_call(true);
 	return res;
@@ -565,11 +657,9 @@ SPI_execute_extended(const char *src,
 
 	_SPI_prepare_oneshot_plan(src, &plan);
 
-	res = _SPI_execute_plan(&plan, options->params,
+	res = _SPI_execute_plan(&plan, options,
 							InvalidSnapshot, InvalidSnapshot,
-							options->read_only, options->no_snapshots,
-							true, options->tcount,
-							options->dest, options->owner);
+							true);
 
 	_SPI_end_call(true);
 	return res;
@@ -580,6 +670,7 @@ int
 SPI_execute_plan(SPIPlanPtr plan, Datum *Values, const char *Nulls,
 				 bool read_only, long tcount)
 {
+	SPIExecuteOptions options;
 	int			res;
 
 	if (plan == NULL || plan->magic != _SPI_PLAN_MAGIC || tcount < 0)
@@ -592,13 +683,15 @@ SPI_execute_plan(SPIPlanPtr plan, Datum *Values, const char *Nulls,
 	if (res < 0)
 		return res;
 
-	res = _SPI_execute_plan(plan,
-							_SPI_convert_params(plan->nargs, plan->argtypes,
-												Values, Nulls),
+	memset(&options, 0, sizeof(options));
+	options.params = _SPI_convert_params(plan->nargs, plan->argtypes,
+										 Values, Nulls);
+	options.read_only = read_only;
+	options.tcount = tcount;
+
+	res = _SPI_execute_plan(plan, &options,
 							InvalidSnapshot, InvalidSnapshot,
-							read_only, false,
-							true, tcount,
-							NULL, NULL);
+							true);
 
 	_SPI_end_call(true);
 	return res;
@@ -625,11 +718,9 @@ SPI_execute_plan_extended(SPIPlanPtr plan,
 	if (res < 0)
 		return res;
 
-	res = _SPI_execute_plan(plan, options->params,
+	res = _SPI_execute_plan(plan, options,
 							InvalidSnapshot, InvalidSnapshot,
-							options->read_only, options->no_snapshots,
-							true, options->tcount,
-							options->dest, options->owner);
+							true);
 
 	_SPI_end_call(true);
 	return res;
@@ -640,6 +731,7 @@ int
 SPI_execute_plan_with_paramlist(SPIPlanPtr plan, ParamListInfo params,
 								bool read_only, long tcount)
 {
+	SPIExecuteOptions options;
 	int			res;
 
 	if (plan == NULL || plan->magic != _SPI_PLAN_MAGIC || tcount < 0)
@@ -649,11 +741,14 @@ SPI_execute_plan_with_paramlist(SPIPlanPtr plan, ParamListInfo params,
 	if (res < 0)
 		return res;
 
-	res = _SPI_execute_plan(plan, params,
+	memset(&options, 0, sizeof(options));
+	options.params = params;
+	options.read_only = read_only;
+	options.tcount = tcount;
+
+	res = _SPI_execute_plan(plan, &options,
 							InvalidSnapshot, InvalidSnapshot,
-							read_only, false,
-							true, tcount,
-							NULL, NULL);
+							true);
 
 	_SPI_end_call(true);
 	return res;
@@ -678,6 +773,7 @@ SPI_execute_snapshot(SPIPlanPtr plan,
 					 Snapshot snapshot, Snapshot crosscheck_snapshot,
 					 bool read_only, bool fire_triggers, long tcount)
 {
+	SPIExecuteOptions options;
 	int			res;
 
 	if (plan == NULL || plan->magic != _SPI_PLAN_MAGIC || tcount < 0)
@@ -690,13 +786,15 @@ SPI_execute_snapshot(SPIPlanPtr plan,
 	if (res < 0)
 		return res;
 
-	res = _SPI_execute_plan(plan,
-							_SPI_convert_params(plan->nargs, plan->argtypes,
-												Values, Nulls),
+	memset(&options, 0, sizeof(options));
+	options.params = _SPI_convert_params(plan->nargs, plan->argtypes,
+										 Values, Nulls);
+	options.read_only = read_only;
+	options.tcount = tcount;
+
+	res = _SPI_execute_plan(plan, &options,
 							snapshot, crosscheck_snapshot,
-							read_only, false,
-							fire_triggers, tcount,
-							NULL, NULL);
+							fire_triggers);
 
 	_SPI_end_call(true);
 	return res;
@@ -717,6 +815,7 @@ SPI_execute_with_args(const char *src,
 	int			res;
 	_SPI_plan	plan;
 	ParamListInfo paramLI;
+	SPIExecuteOptions options;
 
 	if (src == NULL || nargs < 0 || tcount < 0)
 		return SPI_ERROR_ARGUMENT;
@@ -742,11 +841,14 @@ SPI_execute_with_args(const char *src,
 
 	_SPI_prepare_oneshot_plan(src, &plan);
 
-	res = _SPI_execute_plan(&plan, paramLI,
+	memset(&options, 0, sizeof(options));
+	options.params = paramLI;
+	options.read_only = read_only;
+	options.tcount = tcount;
+
+	res = _SPI_execute_plan(&plan, &options,
 							InvalidSnapshot, InvalidSnapshot,
-							read_only, false,
-							true, tcount,
-							NULL, NULL);
+							true);
 
 	_SPI_end_call(true);
 	return res;
@@ -1038,7 +1140,7 @@ SPI_modifytuple(Relation rel, HeapTuple tuple, int natts, int *attnum,
 		if (attnum[i] <= 0 || attnum[i] > numberOfAttributes)
 			break;
 		v[attnum[i] - 1] = Values[i];
-		n[attnum[i] - 1] = (Nulls && Nulls[i] == 'n') ? true : false;
+		n[attnum[i] - 1] = (Nulls && Nulls[i] == 'n');
 	}
 
 	if (i == natts)				/* no errors in *attnum */
@@ -1490,16 +1592,22 @@ SPI_cursor_open_internal(const char *name, SPIPlanPtr plan,
 	if (!SPI_is_cursor_plan(plan))
 	{
 		/* try to give a good error message */
+		const char *cmdtag;
+
 		if (list_length(plan->plancache_list) != 1)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_CURSOR_DEFINITION),
 					 errmsg("cannot open multi-query plan as cursor")));
 		plansource = (CachedPlanSource *) linitial(plan->plancache_list);
+		/* A SELECT that fails SPI_is_cursor_plan() must be SELECT INTO */
+		if (plansource->commandTag == CMDTAG_SELECT)
+			cmdtag = "SELECT INTO";
+		else
+			cmdtag = GetCommandTagName(plansource->commandTag);
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_CURSOR_DEFINITION),
 		/* translator: %s is name of a SQL command, eg INSERT */
-				 errmsg("cannot open %s query as cursor",
-						GetCommandTagName(plansource->commandTag))));
+				 errmsg("cannot open %s query as cursor", cmdtag)));
 	}
 
 	Assert(list_length(plan->plancache_list) == 1);
@@ -1921,6 +2029,10 @@ SPI_result_code_string(int code)
 			return "SPI_OK_REL_REGISTER";
 		case SPI_OK_REL_UNREGISTER:
 			return "SPI_OK_REL_UNREGISTER";
+		case SPI_OK_TD_REGISTER:
+			return "SPI_OK_TD_REGISTER";
+		case SPI_OK_MERGE:
+			return "SPI_OK_MERGE";
 	}
 	/* Unrecognized code ... return something useful ... */
 	sprintf(buf, "Unrecognized SPI code %d", code);
@@ -2150,7 +2262,7 @@ _SPI_prepare_plan(const char *src, SPIPlanPtr plan)
 		if (plan->parserSetup != NULL)
 		{
 			Assert(plan->nargs == 0);
-			stmt_list = pg_analyze_and_rewrite_params(parsetree,
+			stmt_list = pg_analyze_and_rewrite_withcb(parsetree,
 													  src,
 													  plan->parserSetup,
 													  plan->parserSetupArg,
@@ -2158,11 +2270,11 @@ _SPI_prepare_plan(const char *src, SPIPlanPtr plan)
 		}
 		else
 		{
-			stmt_list = pg_analyze_and_rewrite(parsetree,
-											   src,
-											   plan->argtypes,
-											   plan->nargs,
-											   _SPI_current->queryEnv);
+			stmt_list = pg_analyze_and_rewrite_fixedparams(parsetree,
+														   src,
+														   plan->argtypes,
+														   plan->nargs,
+														   _SPI_current->queryEnv);
 		}
 
 		/* Finish filling in the CachedPlanSource */
@@ -2258,32 +2370,36 @@ _SPI_prepare_oneshot_plan(const char *src, SPIPlanPtr plan)
 }
 
 /*
- * Execute the given plan with the given parameter values
+ * _SPI_execute_plan: execute the given plan with the given options
  *
+ * options contains options accessible from outside SPI:
+ * params: parameter values to pass to query
+ * read_only: true for read-only execution (no CommandCounterIncrement)
+ * allow_nonatomic: true to allow nonatomic CALL/DO execution
+ * must_return_tuples: throw error if query doesn't return tuples
+ * tcount: execution tuple-count limit, or 0 for none
+ * dest: DestReceiver to receive output, or NULL for normal SPI output
+ * owner: ResourceOwner that will be used to hold refcount on plan;
+ *		if NULL, CurrentResourceOwner is used (ignored for non-saved plan)
+ *
+ * Additional, only-internally-accessible options:
  * snapshot: query snapshot to use, or InvalidSnapshot for the normal
  *		behavior of taking a new snapshot for each query.
  * crosscheck_snapshot: for RI use, all others pass InvalidSnapshot
- * read_only: true for read-only execution (no CommandCounterIncrement)
- * no_snapshots: true to skip snapshot management
  * fire_triggers: true to fire AFTER triggers at end of query (normal case);
  *		false means any AFTER triggers are postponed to end of outer query
- * tcount: execution tuple-count limit, or 0 for none
- * caller_dest: DestReceiver to receive output, or NULL for normal SPI output
- * plan_owner: ResourceOwner that will be used to hold refcount on plan;
- *		if NULL, CurrentResourceOwner is used (ignored for non-saved plan)
  */
 static int
-_SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
+_SPI_execute_plan(SPIPlanPtr plan, const SPIExecuteOptions *options,
 				  Snapshot snapshot, Snapshot crosscheck_snapshot,
-				  bool read_only, bool no_snapshots,
-				  bool fire_triggers, uint64 tcount,
-				  DestReceiver *caller_dest, ResourceOwner plan_owner)
+				  bool fire_triggers)
 {
 	int			my_res = 0;
 	uint64		my_processed = 0;
 	SPITupleTable *my_tuptable = NULL;
 	int			res = 0;
 	bool		pushed_active_snap = false;
+	ResourceOwner plan_owner = options->owner;
 	SPICallbackArg spicallbackarg;
 	ErrorContextCallback spierrcontext;
 	CachedPlan *cplan = NULL;
@@ -2318,12 +2434,13 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 	 * In the first two cases, we can just push the snap onto the stack once
 	 * for the whole plan list.
 	 *
-	 * But if no_snapshots is true, then don't manage snapshots at all here.
-	 * The caller must then take care of that.
+	 * Note that snapshot != InvalidSnapshot implies an atomic execution
+	 * context.
 	 */
-	if (snapshot != InvalidSnapshot && !no_snapshots)
+	if (snapshot != InvalidSnapshot)
 	{
-		if (read_only)
+		Assert(!options->allow_nonatomic);
+		if (options->read_only)
 		{
 			PushActiveSnapshot(snapshot);
 			pushed_active_snap = true;
@@ -2345,6 +2462,17 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 	else if (plan_owner == NULL)
 		plan_owner = CurrentResourceOwner;
 
+	/*
+	 * We interpret must_return_tuples as "there must be at least one query,
+	 * and all of them must return tuples".  This is a bit laxer than
+	 * SPI_is_cursor_plan's check, but there seems no reason to enforce that
+	 * there be only one query.
+	 */
+	if (options->must_return_tuples && plan->plancache_list == NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("empty query does not return tuples")));
+
 	foreach(lc1, plan->plancache_list)
 	{
 		CachedPlanSource *plansource = (CachedPlanSource *) lfirst(lc1);
@@ -2360,35 +2488,35 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 		{
 			RawStmt    *parsetree = plansource->raw_parse_tree;
 			const char *src = plansource->query_string;
-			List	   *stmt_list;
+			List	   *querytree_list;
 
 			/*
 			 * Parameter datatypes are driven by parserSetup hook if provided,
 			 * otherwise we use the fixed parameter list.
 			 */
 			if (parsetree == NULL)
-				stmt_list = NIL;
+				querytree_list = NIL;
 			else if (plan->parserSetup != NULL)
 			{
 				Assert(plan->nargs == 0);
-				stmt_list = pg_analyze_and_rewrite_params(parsetree,
-														  src,
-														  plan->parserSetup,
-														  plan->parserSetupArg,
-														  _SPI_current->queryEnv);
+				querytree_list = pg_analyze_and_rewrite_withcb(parsetree,
+															   src,
+															   plan->parserSetup,
+															   plan->parserSetupArg,
+															   _SPI_current->queryEnv);
 			}
 			else
 			{
-				stmt_list = pg_analyze_and_rewrite(parsetree,
-												   src,
-												   plan->argtypes,
-												   plan->nargs,
-												   _SPI_current->queryEnv);
+				querytree_list = pg_analyze_and_rewrite_fixedparams(parsetree,
+																	src,
+																	plan->argtypes,
+																	plan->nargs,
+																	_SPI_current->queryEnv);
 			}
 
 			/* Finish filling in the CachedPlanSource */
 			CompleteCachedPlan(plansource,
-							   stmt_list,
+							   querytree_list,
 							   NULL,
 							   plan->argtypes,
 							   plan->nargs,
@@ -2399,24 +2527,70 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 		}
 
 		/*
+		 * If asked to, complain when query does not return tuples.
+		 * (Replanning can't change this, so we can check it before that.
+		 * However, we can't check it till after parse analysis, so in the
+		 * case of a one-shot plan this is the earliest we could check.)
+		 */
+		if (options->must_return_tuples && !plansource->resultDesc)
+		{
+			/* try to give a good error message */
+			const char *cmdtag;
+
+			/* A SELECT without resultDesc must be SELECT INTO */
+			if (plansource->commandTag == CMDTAG_SELECT)
+				cmdtag = "SELECT INTO";
+			else
+				cmdtag = GetCommandTagName(plansource->commandTag);
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+			/* translator: %s is name of a SQL command, eg INSERT */
+					 errmsg("%s query does not return tuples", cmdtag)));
+		}
+
+		/*
 		 * Replan if needed, and increment plan refcount.  If it's a saved
 		 * plan, the refcount must be backed by the plan_owner.
 		 */
-		cplan = GetCachedPlan(plansource, paramLI,
+		cplan = GetCachedPlan(plansource, options->params,
 							  plan_owner, _SPI_current->queryEnv);
 
 		stmt_list = cplan->stmt_list;
 
 		/*
-		 * In the default non-read-only case, get a new snapshot, replacing
-		 * any that we pushed in a previous cycle.
+		 * If we weren't given a specific snapshot to use, and the statement
+		 * list requires a snapshot, set that up.
 		 */
-		if (snapshot == InvalidSnapshot && !read_only && !no_snapshots)
+		if (snapshot == InvalidSnapshot &&
+			(list_length(stmt_list) > 1 ||
+			 (list_length(stmt_list) == 1 &&
+			  PlannedStmtRequiresSnapshot(linitial_node(PlannedStmt,
+														stmt_list)))))
 		{
-			if (pushed_active_snap)
-				PopActiveSnapshot();
-			PushActiveSnapshot(GetTransactionSnapshot());
-			pushed_active_snap = true;
+			/*
+			 * First, ensure there's a Portal-level snapshot.  This back-fills
+			 * the snapshot stack in case the previous operation was a COMMIT
+			 * or ROLLBACK inside a procedure or DO block.  (We can't put back
+			 * the Portal snapshot any sooner, or we'd break cases like doing
+			 * SET or LOCK just after COMMIT.)  It's enough to check once per
+			 * statement list, since COMMIT/ROLLBACK/CALL/DO can't appear
+			 * within a multi-statement list.
+			 */
+			EnsurePortalSnapshotExists();
+
+			/*
+			 * In the default non-read-only case, get a new per-statement-list
+			 * snapshot, replacing any that we pushed in a previous cycle.
+			 * Skip it when doing non-atomic execution, though (we rely
+			 * entirely on the Portal snapshot in that case).
+			 */
+			if (!options->read_only && !options->allow_nonatomic)
+			{
+				if (pushed_active_snap)
+					PopActiveSnapshot();
+				PushActiveSnapshot(GetTransactionSnapshot());
+				pushed_active_snap = true;
+			}
 		}
 
 		foreach(lc2, stmt_list)
@@ -2434,6 +2608,7 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 			_SPI_current->processed = 0;
 			_SPI_current->tuptable = NULL;
 
+			/* Check for unsupported cases. */
 			if (stmt->utilityStmt)
 			{
 				if (IsA(stmt->utilityStmt, CopyStmt))
@@ -2453,7 +2628,7 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 				}
 			}
 
-			if (read_only && !CommandIsReadOnly(stmt))
+			if (options->read_only && !CommandIsReadOnly(stmt))
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				/* translator: %s is a SQL statement name */
@@ -2462,9 +2637,10 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 
 			/*
 			 * If not read-only mode, advance the command counter before each
-			 * command and update the snapshot.
+			 * command and update the snapshot.  (But skip it if the snapshot
+			 * isn't under our control.)
 			 */
-			if (!read_only && !no_snapshots)
+			if (!options->read_only && pushed_active_snap)
 			{
 				CommandCounterIncrement();
 				UpdateActiveSnapshotCommandId();
@@ -2476,8 +2652,8 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 			 */
 			if (!canSetTag)
 				dest = CreateDestReceiver(DestNone);
-			else if (caller_dest)
-				dest = caller_dest;
+			else if (options->dest)
+				dest = options->dest;
 			else
 				dest = CreateDestReceiver(DestSPI);
 
@@ -2495,10 +2671,11 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 										plansource->query_string,
 										snap, crosscheck_snapshot,
 										dest,
-										paramLI, _SPI_current->queryEnv,
+										options->params,
+										_SPI_current->queryEnv,
 										0);
 				res = _SPI_pquery(qdesc, fire_triggers,
-								  canSetTag ? tcount : 0);
+								  canSetTag ? options->tcount : 0);
 				FreeQueryDesc(qdesc);
 			}
 			else
@@ -2507,13 +2684,11 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 				QueryCompletion qc;
 
 				/*
-				 * If the SPI context is atomic, or we are asked to manage
-				 * snapshots, then we are in an atomic execution context.
-				 * Conversely, to propagate a nonatomic execution context, the
-				 * caller must be in a nonatomic SPI context and manage
-				 * snapshots itself.
+				 * If the SPI context is atomic, or we were not told to allow
+				 * nonatomic operations, tell ProcessUtility this is an atomic
+				 * execution context.
 				 */
-				if (_SPI_current->atomic || !no_snapshots)
+				if (_SPI_current->atomic || !options->allow_nonatomic)
 					context = PROCESS_UTILITY_QUERY;
 				else
 					context = PROCESS_UTILITY_QUERY_NONATOMIC;
@@ -2521,8 +2696,9 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 				InitializeQueryCompletion(&qc);
 				ProcessUtility(stmt,
 							   plansource->query_string,
+							   true,	/* protect plancache's node tree */
 							   context,
-							   paramLI,
+							   options->params,
 							   _SPI_current->queryEnv,
 							   dest,
 							   &qc);
@@ -2608,7 +2784,7 @@ _SPI_execute_plan(SPIPlanPtr plan, ParamListInfo paramLI,
 		 * command.  This ensures that its effects are visible, in case it was
 		 * DDL that would affect the next CachedPlanSource.
 		 */
-		if (!read_only)
+		if (!options->read_only)
 			CommandCounterIncrement();
 	}
 
@@ -2708,6 +2884,9 @@ _SPI_pquery(QueryDesc *queryDesc, bool fire_triggers, uint64 tcount)
 				res = SPI_OK_UPDATE_RETURNING;
 			else
 				res = SPI_OK_UPDATE;
+			break;
+		case CMD_MERGE:
+			res = SPI_OK_MERGE;
 			break;
 		default:
 			return SPI_ERROR_OPUNKNOWN;
@@ -3166,7 +3345,7 @@ SPI_register_trigger_data(TriggerData *tdata)
 	if (tdata->tg_newtable)
 	{
 		EphemeralNamedRelation enr =
-		palloc(sizeof(EphemeralNamedRelationData));
+			palloc(sizeof(EphemeralNamedRelationData));
 		int			rc;
 
 		enr->md.name = tdata->tg_trigger->tgnewtable;
@@ -3183,7 +3362,7 @@ SPI_register_trigger_data(TriggerData *tdata)
 	if (tdata->tg_oldtable)
 	{
 		EphemeralNamedRelation enr =
-		palloc(sizeof(EphemeralNamedRelationData));
+			palloc(sizeof(EphemeralNamedRelationData));
 		int			rc;
 
 		enr->md.name = tdata->tg_trigger->tgoldtable;

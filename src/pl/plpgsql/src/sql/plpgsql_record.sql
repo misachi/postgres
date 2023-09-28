@@ -3,6 +3,7 @@
 --
 
 create type two_int4s as (f1 int4, f2 int4);
+create type more_int4s as (f0 text, f1 int4, f2 int4);
 create type two_int8s as (q1 int8, q2 int8);
 create type nested_int8s as (c1 two_int8s, c2 two_int8s);
 
@@ -257,12 +258,22 @@ create function getf1(x record) returns int language plpgsql as
 $$ begin return x.f1; end $$;
 select getf1(1);
 select getf1(row(1,2));
--- the context stack is different when debug_invalidate_system_caches_always
+select getf1(row(1,2)::two_int4s);
+select getf1(row('foo',123,456)::more_int4s);
+-- the context stack is different when debug_discard_caches
 -- is set, so suppress context output
 \set SHOW_CONTEXT never
 select getf1(row(1,2)::two_int8s);
 \set SHOW_CONTEXT errors
 select getf1(row(1,2));
+
+-- this seemingly-equivalent case behaves a bit differently,
+-- because the core parser's handling of $N symbols is simplistic
+create function getf2(record) returns int language plpgsql as
+$$ begin return $1.f2; end $$;
+select getf2(row(1,2));  -- ideally would work, but does not
+select getf2(row(1,2)::two_int4s);
+select getf2(row('foo',123,456)::more_int4s);
 
 -- check behavior when assignment to FOR-loop variable requires coercion
 do $$
@@ -316,7 +327,7 @@ select sillyaddone(42);
 -- for now see plpgsql_cache test
 
 alter table mutable drop column f1;
--- the context stack is different when debug_invalidate_system_caches_always
+-- the context stack is different when debug_discard_caches
 -- is set, so suppress context output
 \set SHOW_CONTEXT never
 select sillyaddone(42);  -- fail
@@ -328,7 +339,7 @@ select getf3(null::mutable);  -- doesn't work yet
 alter table mutable add column f3 int;
 select getf3(null::mutable);  -- now it works
 alter table mutable drop column f3;
--- the context stack is different when debug_invalidate_system_caches_always
+-- the context stack is different when debug_discard_caches
 -- is set, so suppress context output
 \set SHOW_CONTEXT never
 select getf3(null::mutable);  -- fails again
@@ -346,7 +357,7 @@ select sillyaddtwo(42);  -- fail
 create table mutable2(f1 int, f2 text);
 select sillyaddtwo(42);
 drop table mutable2;
--- the context stack is different when debug_invalidate_system_caches_always
+-- the context stack is different when debug_discard_caches
 -- is set, so suppress context output
 \set SHOW_CONTEXT never
 select sillyaddtwo(42);  -- fail

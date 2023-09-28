@@ -139,6 +139,8 @@ if test x"$pgac_cv__128bit_int" = xyes ; then
 /* This must match the corresponding code in c.h: */
 #if defined(__GNUC__) || defined(__SUNPRO_C) || defined(__IBMC__)
 #define pg_attribute_aligned(a) __attribute__((aligned(a)))
+#elif defined(_MSC_VER)
+#define pg_attribute_aligned(a) __declspec(align(a))
 #endif
 typedef __int128 int128a
 #if defined(pg_attribute_aligned)
@@ -163,32 +165,6 @@ if (q != holder)
     AC_CHECK_ALIGNOF(PG_INT128_TYPE)
   fi
 fi])# PGAC_TYPE_128BIT_INT
-
-
-# PGAC_C_FUNCNAME_SUPPORT
-# -----------------------
-# Check if the C compiler understands __func__ (C99) or __FUNCTION__ (gcc).
-# Define HAVE_FUNCNAME__FUNC or HAVE_FUNCNAME__FUNCTION accordingly.
-AC_DEFUN([PGAC_C_FUNCNAME_SUPPORT],
-[AC_CACHE_CHECK(for __func__, pgac_cv_funcname_func_support,
-[AC_COMPILE_IFELSE([AC_LANG_PROGRAM([#include <stdio.h>],
-[printf("%s\n", __func__);])],
-[pgac_cv_funcname_func_support=yes],
-[pgac_cv_funcname_func_support=no])])
-if test x"$pgac_cv_funcname_func_support" = xyes ; then
-AC_DEFINE(HAVE_FUNCNAME__FUNC, 1,
-          [Define to 1 if your compiler understands __func__.])
-else
-AC_CACHE_CHECK(for __FUNCTION__, pgac_cv_funcname_function_support,
-[AC_COMPILE_IFELSE([AC_LANG_PROGRAM([#include <stdio.h>],
-[printf("%s\n", __FUNCTION__);])],
-[pgac_cv_funcname_function_support=yes],
-[pgac_cv_funcname_function_support=no])])
-if test x"$pgac_cv_funcname_function_support" = xyes ; then
-AC_DEFINE(HAVE_FUNCNAME__FUNCTION, 1,
-          [Define to 1 if your compiler understands __FUNCTION__.])
-fi
-fi])# PGAC_C_FUNCNAME_SUPPORT
 
 
 
@@ -381,6 +357,28 @@ fi])# PGAC_CHECK_BUILTIN_FUNC
 
 
 
+# PGAC_CHECK_BUILTIN_FUNC_PTR
+# -----------------------
+# Like PGAC_CHECK_BUILTIN_FUNC, except that the function is assumed to
+# return a pointer type, and the argument(s) should be given literally.
+# This handles some cases that PGAC_CHECK_BUILTIN_FUNC doesn't.
+AC_DEFUN([PGAC_CHECK_BUILTIN_FUNC_PTR],
+[AC_CACHE_CHECK(for $1, pgac_cv$1,
+[AC_LINK_IFELSE([AC_LANG_PROGRAM([
+void *
+call$1(void)
+{
+    return $1($2);
+}], [])],
+[pgac_cv$1=yes],
+[pgac_cv$1=no])])
+if test x"${pgac_cv$1}" = xyes ; then
+AC_DEFINE_UNQUOTED(AS_TR_CPP([HAVE$1]), 1,
+                   [Define to 1 if your compiler understands $1.])
+fi])# PGAC_CHECK_BUILTIN_FUNC_PTR
+
+
+
 # PGAC_PROG_VARCC_VARFLAGS_OPT
 # ----------------------------
 # Given a compiler, variable name and a string, check if the compiler
@@ -470,28 +468,37 @@ AC_DEFUN([PGAC_PROG_CXX_CFLAGS_OPT],
 
 
 
-# PGAC_PROG_CC_LDFLAGS_OPT
+# PGAC_PROG_CC_LD_VARFLAGS_OPT
 # ------------------------
 # Given a string, check if the compiler supports the string as a
-# command-line option. If it does, add the string to LDFLAGS.
+# command-line option. If it does, add to the given variable.
 # For reasons you'd really rather not know about, this checks whether
 # you can link to a particular function, not just whether you can link.
 # In fact, we must actually check that the resulting program runs :-(
-AC_DEFUN([PGAC_PROG_CC_LDFLAGS_OPT],
-[define([Ac_cachevar], [AS_TR_SH([pgac_cv_prog_cc_ldflags_$1])])dnl
-AC_CACHE_CHECK([whether $CC supports $1], [Ac_cachevar],
+AC_DEFUN([PGAC_PROG_CC_LD_VARFLAGS_OPT],
+[define([Ac_cachevar], [AS_TR_SH([pgac_cv_prog_cc_$1_$2])])dnl
+AC_CACHE_CHECK([whether $CC supports $2, for $1], [Ac_cachevar],
 [pgac_save_LDFLAGS=$LDFLAGS
-LDFLAGS="$pgac_save_LDFLAGS $1"
-AC_RUN_IFELSE([AC_LANG_PROGRAM([extern void $2 (); void (*fptr) () = $2;],[])],
+LDFLAGS="$pgac_save_LDFLAGS $2"
+AC_RUN_IFELSE([AC_LANG_PROGRAM([extern void $3 (); void (*fptr) () = $3;],[])],
               [Ac_cachevar=yes],
               [Ac_cachevar=no],
               [Ac_cachevar="assuming no"])
 LDFLAGS="$pgac_save_LDFLAGS"])
 if test x"$Ac_cachevar" = x"yes"; then
-  LDFLAGS="$LDFLAGS $1"
+  $1="${$1} $2"
 fi
 undefine([Ac_cachevar])dnl
+])# PGAC_PROG_CC_LD_VARFLAGS_OPT
+
+# PGAC_PROG_CC_LDFLAGS_OPT
+# ------------------------
+# Convenience wrapper around PGAC_PROG_CC_LD_VARFLAGS_OPT that adds to
+# LDFLAGS.
+AC_DEFUN([PGAC_PROG_CC_LDFLAGS_OPT],
+[PGAC_PROG_CC_LD_VARFLAGS_OPT(LDFLAGS, [$1], [$2])
 ])# PGAC_PROG_CC_LDFLAGS_OPT
+
 
 # PGAC_HAVE_GCC__SYNC_CHAR_TAS
 # ----------------------------
@@ -599,7 +606,7 @@ fi])# PGAC_HAVE_GCC__ATOMIC_INT64_CAS
 # the other ones are, on x86-64 platforms)
 #
 # An optional compiler flag can be passed as argument (e.g. -msse4.2). If the
-# intrinsics are supported, sets pgac_sse42_crc32_intrinsics, and CFLAGS_SSE42.
+# intrinsics are supported, sets pgac_sse42_crc32_intrinsics, and CFLAGS_CRC.
 AC_DEFUN([PGAC_SSE42_CRC32_INTRINSICS],
 [define([Ac_cachevar], [AS_TR_SH([pgac_cv_sse42_crc32_intrinsics_$1])])dnl
 AC_CACHE_CHECK([for _mm_crc32_u8 and _mm_crc32_u32 with CFLAGS=$1], [Ac_cachevar],
@@ -615,7 +622,7 @@ AC_LINK_IFELSE([AC_LANG_PROGRAM([#include <nmmintrin.h>],
   [Ac_cachevar=no])
 CFLAGS="$pgac_save_CFLAGS"])
 if test x"$Ac_cachevar" = x"yes"; then
-  CFLAGS_SSE42="$1"
+  CFLAGS_CRC="$1"
   pgac_sse42_crc32_intrinsics=yes
 fi
 undefine([Ac_cachevar])dnl
@@ -631,7 +638,7 @@ undefine([Ac_cachevar])dnl
 #
 # An optional compiler flag can be passed as argument (e.g.
 # -march=armv8-a+crc). If the intrinsics are supported, sets
-# pgac_armv8_crc32c_intrinsics, and CFLAGS_ARMV8_CRC32C.
+# pgac_armv8_crc32c_intrinsics, and CFLAGS_CRC.
 AC_DEFUN([PGAC_ARMV8_CRC32C_INTRINSICS],
 [define([Ac_cachevar], [AS_TR_SH([pgac_cv_armv8_crc32c_intrinsics_$1])])dnl
 AC_CACHE_CHECK([for __crc32cb, __crc32ch, __crc32cw, and __crc32cd with CFLAGS=$1], [Ac_cachevar],
@@ -649,8 +656,41 @@ AC_LINK_IFELSE([AC_LANG_PROGRAM([#include <arm_acle.h>],
   [Ac_cachevar=no])
 CFLAGS="$pgac_save_CFLAGS"])
 if test x"$Ac_cachevar" = x"yes"; then
-  CFLAGS_ARMV8_CRC32C="$1"
+  CFLAGS_CRC="$1"
   pgac_armv8_crc32c_intrinsics=yes
 fi
 undefine([Ac_cachevar])dnl
 ])# PGAC_ARMV8_CRC32C_INTRINSICS
+
+# PGAC_LOONGARCH_CRC32C_INTRINSICS
+# ---------------------------
+# Check if the compiler supports the LoongArch CRCC instructions, using
+# __builtin_loongarch_crcc_w_b_w, __builtin_loongarch_crcc_w_h_w,
+# __builtin_loongarch_crcc_w_w_w and __builtin_loongarch_crcc_w_d_w
+# intrinsic functions.
+#
+# We test for the 8-byte variant since platforms capable of running
+# Postgres are 64-bit only (as of PG17), and we know CRC instructions
+# are available there without a runtime check.
+#
+# If the intrinsics are supported, sets pgac_loongarch_crc32c_intrinsics.
+AC_DEFUN([PGAC_LOONGARCH_CRC32C_INTRINSICS],
+[define([Ac_cachevar], [AS_TR_SH([pgac_cv_loongarch_crc32c_intrinsics])])dnl
+AC_CACHE_CHECK(
+  [for __builtin_loongarch_crcc_w_b_w, __builtin_loongarch_crcc_w_h_w, __builtin_loongarch_crcc_w_w_w and __builtin_loongarch_crcc_w_d_w],
+  [Ac_cachevar],
+[AC_LINK_IFELSE([AC_LANG_PROGRAM([],
+  [unsigned int crc = 0;
+   crc = __builtin_loongarch_crcc_w_b_w(0, crc);
+   crc = __builtin_loongarch_crcc_w_h_w(0, crc);
+   crc = __builtin_loongarch_crcc_w_w_w(0, crc);
+   crc = __builtin_loongarch_crcc_w_d_w(0, crc);
+   /* return computed value, to prevent the above being optimized away */
+   return crc == 0;])],
+  [Ac_cachevar=yes],
+  [Ac_cachevar=no])])
+if test x"$Ac_cachevar" = x"yes"; then
+  pgac_loongarch_crc32c_intrinsics=yes
+fi
+undefine([Ac_cachevar])dnl
+])# PGAC_LOONGARCH_CRC32C_INTRINSICS

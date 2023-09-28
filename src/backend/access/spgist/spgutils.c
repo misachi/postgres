@@ -4,7 +4,7 @@
  *	  various support functions for SP-GiST
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -25,6 +25,7 @@
 #include "catalog/pg_amop.h"
 #include "commands/vacuum.h"
 #include "nodes/nodeFuncs.h"
+#include "parser/parse_coerce.h"
 #include "storage/bufmgr.h"
 #include "storage/indexfsm.h"
 #include "storage/lmgr.h"
@@ -61,6 +62,7 @@ spghandler(PG_FUNCTION_ARGS)
 	amroutine->amcanparallel = false;
 	amroutine->amcaninclude = true;
 	amroutine->amusemaintenanceworkmem = false;
+	amroutine->amsummarizing = false;
 	amroutine->amparallelvacuumoptions =
 		VACUUM_OPTION_PARALLEL_BULKDEL | VACUUM_OPTION_PARALLEL_COND_CLEANUP;
 	amroutine->amkeytype = InvalidOid;
@@ -165,8 +167,8 @@ fillTypeDesc(SpGistTypeDesc *desc, Oid type)
 	typtup = (Form_pg_type) GETSTRUCT(tp);
 	desc->attlen = typtup->typlen;
 	desc->attbyval = typtup->typbyval;
-	desc->attstorage = typtup->typstorage;
 	desc->attalign = typtup->typalign;
+	desc->attstorage = typtup->typstorage;
 	ReleaseSysCache(tp);
 }
 
@@ -218,8 +220,19 @@ spgGetCache(Relation index)
 		 * correctly, so believe leafType if it's given.)
 		 */
 		if (!OidIsValid(cache->config.leafType))
+		{
 			cache->config.leafType =
 				TupleDescAttr(RelationGetDescr(index), spgKeyColumn)->atttypid;
+
+			/*
+			 * If index column type is binary-coercible to atttype (for
+			 * example, it's a domain over atttype), treat it as plain atttype
+			 * to avoid thinking we need to compress.
+			 */
+			if (cache->config.leafType != atttype &&
+				IsBinaryCoercible(cache->config.leafType, atttype))
+				cache->config.leafType = atttype;
+		}
 
 		/* Get the information we need about each relevant datatype */
 		fillTypeDesc(&cache->attType, atttype);
@@ -304,8 +317,8 @@ getSpGistTupleDesc(Relation index, SpGistTypeDesc *keyType)
 		att->attalign = keyType->attalign;
 		att->attstorage = keyType->attstorage;
 		/* We shouldn't need to bother with making these valid: */
-		att->attcollation = InvalidOid;
 		att->attcompression = InvalidCompressionMethod;
+		att->attcollation = InvalidOid;
 		/* In case we changed typlen, we'd better reset following offsets */
 		for (int i = spgFirstIncludeColumn; i < outTupDesc->natts; i++)
 			TupleDescAttr(outTupDesc, i)->attcacheoff = -1;
@@ -353,7 +366,6 @@ Buffer
 SpGistNewBuffer(Relation index)
 {
 	Buffer		buffer;
-	bool		needLock;
 
 	/* First, try to get a page from FSM */
 	for (;;)
@@ -393,16 +405,8 @@ SpGistNewBuffer(Relation index)
 		ReleaseBuffer(buffer);
 	}
 
-	/* Must extend the file */
-	needLock = !RELATION_IS_LOCAL(index);
-	if (needLock)
-		LockRelationForExtension(index, ExclusiveLock);
-
-	buffer = ReadBuffer(index, P_NEW);
-	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-
-	if (needLock)
-		UnlockRelationForExtension(index, ExclusiveLock);
+	buffer = ExtendBufferedRel(BMR_REL(index), MAIN_FORKNUM, NULL,
+							   EB_LOCK_FIRST);
 
 	return buffer;
 }
@@ -734,7 +738,6 @@ spgoptions(Datum reloptions, bool validate)
 									  RELOPT_KIND_SPGIST,
 									  sizeof(SpGistOptions),
 									  tab, lengthof(tab));
-
 }
 
 /*
@@ -1240,8 +1243,8 @@ SpGistPageAddNewItem(SpGistState *state, Page page, Item item, Size size,
 					*startOffset = offnum + 1;
 			}
 			else
-				elog(PANIC, "failed to add item of size %u to SPGiST index page",
-					 (int) size);
+				elog(PANIC, "failed to add item of size %zu to SPGiST index page",
+					 size);
 
 			return offnum;
 		}
@@ -1252,8 +1255,8 @@ SpGistPageAddNewItem(SpGistState *state, Page page, Item item, Size size,
 						 InvalidOffsetNumber, false, false);
 
 	if (offnum == InvalidOffsetNumber && !errorOK)
-		elog(ERROR, "failed to add item of size %u to SPGiST index page",
-			 (int) size);
+		elog(ERROR, "failed to add item of size %zu to SPGiST index page",
+			 size);
 
 	return offnum;
 }
@@ -1290,7 +1293,7 @@ spgproperty(Oid index_oid, int attno,
 	/*
 	 * Currently, SP-GiST distance-ordered scans require that there be a
 	 * distance operator in the opclass with the default types. So we assume
-	 * that if such a operator exists, then there's a reason for it.
+	 * that if such an operator exists, then there's a reason for it.
 	 */
 
 	/* First we need to know the column's opclass. */

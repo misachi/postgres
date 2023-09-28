@@ -4,7 +4,7 @@
  *	  POSTGRES tuple descriptor definitions.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/tupdesc.h
@@ -127,7 +127,7 @@ extern void DecrTupleDescRefCount(TupleDesc tupdesc);
 
 extern bool equalTupleDescs(TupleDesc tupdesc1, TupleDesc tupdesc2);
 
-extern uint32 hashTupleDesc(TupleDesc tupdesc);
+extern uint32 hashTupleDesc(TupleDesc desc);
 
 extern void TupleDescInitEntry(TupleDesc desc,
 							   AttrNumber attributeNumber,
@@ -147,8 +147,10 @@ extern void TupleDescInitEntryCollation(TupleDesc desc,
 										AttrNumber attributeNumber,
 										Oid collationid);
 
-extern TupleDesc BuildDescForRelation(List *schema);
+extern TupleDesc BuildDescForRelation(const List *columns);
 
-extern TupleDesc BuildDescFromLists(List *names, List *types, List *typmods, List *collations);
+extern TupleDesc BuildDescFromLists(const List *names, const List *types, const List *typmods, const List *collations);
+
+extern Node *TupleDescGetDefault(TupleDesc tupdesc, AttrNumber attnum);
 
 #endif							/* TUPDESC_H */

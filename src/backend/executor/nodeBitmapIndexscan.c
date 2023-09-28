@@ -3,7 +3,7 @@
  * nodeBitmapIndexscan.c
  *	  Routines to support bitmapped index scans of relations
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -183,14 +183,6 @@ ExecEndBitmapIndexScan(BitmapIndexScanState *node)
 	 */
 	indexRelationDesc = node->biss_RelationDesc;
 	indexScanDesc = node->biss_ScanDesc;
-
-	/*
-	 * Free the exprcontext ... now dead code, see ExecFreeExprContext
-	 */
-#ifdef NOT_USED
-	if (node->biss_RuntimeContext)
-		FreeExprContext(node->biss_RuntimeContext, true);
-#endif
 
 	/*
 	 * close the index relation (no-op if we didn't open it)

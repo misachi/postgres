@@ -1,9 +1,9 @@
 /*-------------------------------------------------------------------------
  *
  * option.c
- *		  FDW option handling for postgres_fdw
+ *		  FDW and GUC option handling for postgres_fdw
  *
- * Portions Copyright (c) 2012-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  contrib/postgres_fdw/option.c
@@ -18,8 +18,10 @@
 #include "catalog/pg_user_mapping.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
+#include "libpq/libpq-be.h"
 #include "postgres_fdw.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/varlena.h"
 
 /*
@@ -43,6 +45,11 @@ static PgFdwOption *postgres_fdw_options;
  * Allocated and filled in InitPgFdwOptions.
  */
 static PQconninfoOption *libpq_options;
+
+/*
+ * GUC parameters
+ */
+char	   *pgfdw_application_name = NULL;
 
 /*
  * Helper functions
@@ -83,24 +90,31 @@ postgres_fdw_validator(PG_FUNCTION_ARGS)
 		{
 			/*
 			 * Unknown option specified, complain about it. Provide a hint
-			 * with list of valid options for the object.
+			 * with a valid option that looks similar, if there is one.
 			 */
 			PgFdwOption *opt;
-			StringInfoData buf;
+			const char *closest_match;
+			ClosestMatchState match_state;
+			bool		has_valid_options = false;
 
-			initStringInfo(&buf);
+			initClosestMatch(&match_state, def->defname, 4);
 			for (opt = postgres_fdw_options; opt->keyword; opt++)
 			{
 				if (catalog == opt->optcontext)
-					appendStringInfo(&buf, "%s%s", (buf.len > 0) ? ", " : "",
-									 opt->keyword);
+				{
+					has_valid_options = true;
+					updateClosestMatch(&match_state, opt->keyword);
+				}
 			}
 
+			closest_match = getClosestMatch(&match_state);
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
 					 errmsg("invalid option \"%s\"", def->defname),
-					 errhint("Valid options in this context are: %s",
-							 buf.data)));
+					 has_valid_options ? closest_match ?
+					 errhint("Perhaps you meant the option \"%s\".",
+							 closest_match) : 0 :
+					 errhint("There are no valid options in this context.")));
 		}
 
 		/*
@@ -110,6 +124,8 @@ postgres_fdw_validator(PG_FUNCTION_ARGS)
 			strcmp(def->defname, "updatable") == 0 ||
 			strcmp(def->defname, "truncatable") == 0 ||
 			strcmp(def->defname, "async_capable") == 0 ||
+			strcmp(def->defname, "parallel_commit") == 0 ||
+			strcmp(def->defname, "parallel_abort") == 0 ||
 			strcmp(def->defname, "keep_connections") == 0)
 		{
 			/* these accept only boolean values */
@@ -118,15 +134,27 @@ postgres_fdw_validator(PG_FUNCTION_ARGS)
 		else if (strcmp(def->defname, "fdw_startup_cost") == 0 ||
 				 strcmp(def->defname, "fdw_tuple_cost") == 0)
 		{
-			/* these must have a non-negative numeric value */
-			double		val;
-			char	   *endp;
+			/*
+			 * These must have a floating point value greater than or equal to
+			 * zero.
+			 */
+			char	   *value;
+			double		real_val;
+			bool		is_parsed;
 
-			val = strtod(defGetString(def), &endp);
-			if (*endp || val < 0)
+			value = defGetString(def);
+			is_parsed = parse_real(value, &real_val, 0, NULL);
+
+			if (!is_parsed)
 				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("%s requires a non-negative numeric value",
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("invalid value for floating point option \"%s\": %s",
+								def->defname, value)));
+
+			if (real_val < 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("\"%s\" must be a floating point value greater than or equal to zero",
 								def->defname)));
 		}
 		else if (strcmp(def->defname, "extensions") == 0)
@@ -134,26 +162,26 @@ postgres_fdw_validator(PG_FUNCTION_ARGS)
 			/* check list syntax, warn about uninstalled extensions */
 			(void) ExtractExtensionList(defGetString(def), true);
 		}
-		else if (strcmp(def->defname, "fetch_size") == 0)
+		else if (strcmp(def->defname, "fetch_size") == 0 ||
+				 strcmp(def->defname, "batch_size") == 0)
 		{
-			int			fetch_size;
+			char	   *value;
+			int			int_val;
+			bool		is_parsed;
 
-			fetch_size = strtol(defGetString(def), NULL, 10);
-			if (fetch_size <= 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("%s requires a non-negative integer value",
-								def->defname)));
-		}
-		else if (strcmp(def->defname, "batch_size") == 0)
-		{
-			int			batch_size;
+			value = defGetString(def);
+			is_parsed = parse_int(value, &int_val, 0, NULL);
 
-			batch_size = strtol(defGetString(def), NULL, 10);
-			if (batch_size <= 0)
+			if (!is_parsed)
 				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("%s requires a non-negative integer value",
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("invalid value for integer option \"%s\": %s",
+								def->defname, value)));
+
+			if (int_val <= 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("\"%s\" must be an integer value greater than zero",
 								def->defname)));
 		}
 		else if (strcmp(def->defname, "password_required") == 0)
@@ -171,7 +199,7 @@ postgres_fdw_validator(PG_FUNCTION_ARGS)
 				ereport(ERROR,
 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 						 errmsg("password_required=false is superuser-only"),
-						 errhint("User mappings with the password_required option set to false may only be created or modified by the superuser")));
+						 errhint("User mappings with the password_required option set to false may only be created or modified by the superuser.")));
 		}
 		else if (strcmp(def->defname, "sslcert") == 0 ||
 				 strcmp(def->defname, "sslkey") == 0)
@@ -181,7 +209,24 @@ postgres_fdw_validator(PG_FUNCTION_ARGS)
 				ereport(ERROR,
 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 						 errmsg("sslcert and sslkey are superuser-only"),
-						 errhint("User mappings with the sslcert or sslkey options set may only be created or modified by the superuser")));
+						 errhint("User mappings with the sslcert or sslkey options set may only be created or modified by the superuser.")));
+		}
+		else if (strcmp(def->defname, "analyze_sampling") == 0)
+		{
+			char	   *value;
+
+			value = defGetString(def);
+
+			/* we recognize off/auto/random/system/bernoulli */
+			if (strcmp(value, "off") != 0 &&
+				strcmp(value, "auto") != 0 &&
+				strcmp(value, "random") != 0 &&
+				strcmp(value, "system") != 0 &&
+				strcmp(value, "bernoulli") != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("invalid value for string option \"%s\": %s",
+								def->defname, value)));
 		}
 	}
 
@@ -226,8 +271,14 @@ InitPgFdwOptions(void)
 		/* async_capable is available on both server and table */
 		{"async_capable", ForeignServerRelationId, false},
 		{"async_capable", ForeignTableRelationId, false},
+		{"parallel_commit", ForeignServerRelationId, false},
+		{"parallel_abort", ForeignServerRelationId, false},
 		{"keep_connections", ForeignServerRelationId, false},
 		{"password_required", UserMappingRelationId, false},
+
+		/* sampling is available on both server and table */
+		{"analyze_sampling", ForeignServerRelationId, false},
+		{"analyze_sampling", ForeignTableRelationId, false},
 
 		/*
 		 * sslcert and sslkey are in fact libpq options, but we repeat them
@@ -236,6 +287,12 @@ InitPgFdwOptions(void)
 		 */
 		{"sslcert", UserMappingRelationId, true},
 		{"sslkey", UserMappingRelationId, true},
+
+		/*
+		 * gssdelegation is also a libpq option but should be allowed in a
+		 * user mapping context too
+		 */
+		{"gssdelegation", UserMappingRelationId, true},
 
 		{NULL, InvalidOid, false}
 	};
@@ -421,4 +478,113 @@ ExtractExtensionList(const char *extensionsString, bool warnOnMissing)
 
 	list_free(extlist);
 	return extensionOids;
+}
+
+/*
+ * Replace escape sequences beginning with % character in the given
+ * application_name with status information, and return it.
+ *
+ * This function always returns a palloc'd string, so the caller is
+ * responsible for pfreeing it.
+ */
+char *
+process_pgfdw_appname(const char *appname)
+{
+	const char *p;
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+
+	for (p = appname; *p != '\0'; p++)
+	{
+		if (*p != '%')
+		{
+			/* literal char, just copy */
+			appendStringInfoChar(&buf, *p);
+			continue;
+		}
+
+		/* must be a '%', so skip to the next char */
+		p++;
+		if (*p == '\0')
+			break;				/* format error - ignore it */
+		else if (*p == '%')
+		{
+			/* string contains %% */
+			appendStringInfoChar(&buf, '%');
+			continue;
+		}
+
+		/* process the option */
+		switch (*p)
+		{
+			case 'a':
+				appendStringInfoString(&buf, application_name);
+				break;
+			case 'c':
+				appendStringInfo(&buf, "%lx.%x", (long) (MyStartTime), MyProcPid);
+				break;
+			case 'C':
+				appendStringInfoString(&buf, cluster_name);
+				break;
+			case 'd':
+				if (MyProcPort)
+				{
+					const char *dbname = MyProcPort->database_name;
+
+					if (dbname)
+						appendStringInfoString(&buf, dbname);
+					else
+						appendStringInfoString(&buf, "[unknown]");
+				}
+				break;
+			case 'p':
+				appendStringInfo(&buf, "%d", MyProcPid);
+				break;
+			case 'u':
+				if (MyProcPort)
+				{
+					const char *username = MyProcPort->user_name;
+
+					if (username)
+						appendStringInfoString(&buf, username);
+					else
+						appendStringInfoString(&buf, "[unknown]");
+				}
+				break;
+			default:
+				/* format error - ignore it */
+				break;
+		}
+	}
+
+	return buf.data;
+}
+
+/*
+ * Module load callback
+ */
+void
+_PG_init(void)
+{
+	/*
+	 * Unlike application_name GUC, don't set GUC_IS_NAME flag nor check_hook
+	 * to allow postgres_fdw.application_name to be any string more than
+	 * NAMEDATALEN characters and to include non-ASCII characters. Instead,
+	 * remote server truncates application_name of remote connection to less
+	 * than NAMEDATALEN and replaces any non-ASCII characters in it with a '?'
+	 * character.
+	 */
+	DefineCustomStringVariable("postgres_fdw.application_name",
+							   "Sets the application name to be used on the remote server.",
+							   NULL,
+							   &pgfdw_application_name,
+							   NULL,
+							   PGC_USERSET,
+							   0,
+							   NULL,
+							   NULL,
+							   NULL);
+
+	MarkGUCPrefixReserved("postgres_fdw");
 }

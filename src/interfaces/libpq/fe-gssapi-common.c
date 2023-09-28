@@ -3,7 +3,7 @@
  * fe-gssapi-common.c
  *     The front-end (client) GSSAPI common code
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -34,7 +34,8 @@ pg_GSS_error_int(PQExpBuffer str, OM_uint32 stat, int type)
 		if (gss_display_status(&lmin_s, stat, type, GSS_C_NO_OID,
 							   &msg_ctx, &lmsg) != GSS_S_COMPLETE)
 			break;
-		appendPQExpBuffer(str, " %s", (char *) lmsg.value);
+		appendPQExpBufferChar(str, ' ');
+		appendBinaryPQExpBuffer(str, lmsg.value, lmsg.length);
 		gss_release_buffer(&lmin_s, &lmsg);
 	} while (msg_ctx);
 }
@@ -93,8 +94,7 @@ pg_GSS_load_servicename(PGconn *conn)
 	host = PQhost(conn);
 	if (!(host && host[0] != '\0'))
 	{
-		appendPQExpBufferStr(&conn->errorMessage,
-							 libpq_gettext("host name must be specified\n"));
+		libpq_append_conn_error(conn, "host name must be specified");
 		return STATUS_ERROR;
 	}
 
@@ -106,8 +106,7 @@ pg_GSS_load_servicename(PGconn *conn)
 	temp_gbuf.value = (char *) malloc(maxlen);
 	if (!temp_gbuf.value)
 	{
-		appendPQExpBufferStr(&conn->errorMessage,
-							 libpq_gettext("out of memory\n"));
+		libpq_append_conn_error(conn, "out of memory");
 		return STATUS_ERROR;
 	}
 	snprintf(temp_gbuf.value, maxlen, "%s@%s",

@@ -3,7 +3,7 @@
  * pg_constraint.c
  *	  routines to support manipulation of the pg_constraint relation
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,6 +21,7 @@
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
+#include "catalog/heap.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_constraint.h"
@@ -68,6 +69,8 @@ CreateConstraintEntry(const char *constraintName,
 					  int foreignNKeys,
 					  char foreignUpdateType,
 					  char foreignDeleteType,
+					  const int16 *fkDeleteSetCols,
+					  int numFkDeleteSetCols,
 					  char foreignMatchType,
 					  const Oid *exclOp,
 					  Node *conExpr,
@@ -88,6 +91,7 @@ CreateConstraintEntry(const char *constraintName,
 	ArrayType  *conppeqopArray;
 	ArrayType  *conffeqopArray;
 	ArrayType  *conexclopArray;
+	ArrayType  *confdelsetcolsArray;
 	NameData	cname;
 	int			i;
 	ObjectAddress conobject;
@@ -109,8 +113,7 @@ CreateConstraintEntry(const char *constraintName,
 		conkey = (Datum *) palloc(constraintNKeys * sizeof(Datum));
 		for (i = 0; i < constraintNKeys; i++)
 			conkey[i] = Int16GetDatum(constraintKey[i]);
-		conkeyArray = construct_array(conkey, constraintNKeys,
-									  INT2OID, 2, true, TYPALIGN_SHORT);
+		conkeyArray = construct_array_builtin(conkey, constraintNKeys, INT2OID);
 	}
 	else
 		conkeyArray = NULL;
@@ -122,20 +125,25 @@ CreateConstraintEntry(const char *constraintName,
 		fkdatums = (Datum *) palloc(foreignNKeys * sizeof(Datum));
 		for (i = 0; i < foreignNKeys; i++)
 			fkdatums[i] = Int16GetDatum(foreignKey[i]);
-		confkeyArray = construct_array(fkdatums, foreignNKeys,
-									   INT2OID, 2, true, TYPALIGN_SHORT);
+		confkeyArray = construct_array_builtin(fkdatums, foreignNKeys, INT2OID);
 		for (i = 0; i < foreignNKeys; i++)
 			fkdatums[i] = ObjectIdGetDatum(pfEqOp[i]);
-		conpfeqopArray = construct_array(fkdatums, foreignNKeys,
-										 OIDOID, sizeof(Oid), true, TYPALIGN_INT);
+		conpfeqopArray = construct_array_builtin(fkdatums, foreignNKeys, OIDOID);
 		for (i = 0; i < foreignNKeys; i++)
 			fkdatums[i] = ObjectIdGetDatum(ppEqOp[i]);
-		conppeqopArray = construct_array(fkdatums, foreignNKeys,
-										 OIDOID, sizeof(Oid), true, TYPALIGN_INT);
+		conppeqopArray = construct_array_builtin(fkdatums, foreignNKeys, OIDOID);
 		for (i = 0; i < foreignNKeys; i++)
 			fkdatums[i] = ObjectIdGetDatum(ffEqOp[i]);
-		conffeqopArray = construct_array(fkdatums, foreignNKeys,
-										 OIDOID, sizeof(Oid), true, TYPALIGN_INT);
+		conffeqopArray = construct_array_builtin(fkdatums, foreignNKeys, OIDOID);
+
+		if (numFkDeleteSetCols > 0)
+		{
+			for (i = 0; i < numFkDeleteSetCols; i++)
+				fkdatums[i] = Int16GetDatum(fkDeleteSetCols[i]);
+			confdelsetcolsArray = construct_array_builtin(fkdatums, numFkDeleteSetCols, INT2OID);
+		}
+		else
+			confdelsetcolsArray = NULL;
 	}
 	else
 	{
@@ -143,6 +151,7 @@ CreateConstraintEntry(const char *constraintName,
 		conpfeqopArray = NULL;
 		conppeqopArray = NULL;
 		conffeqopArray = NULL;
+		confdelsetcolsArray = NULL;
 	}
 
 	if (exclOp != NULL)
@@ -152,8 +161,7 @@ CreateConstraintEntry(const char *constraintName,
 		opdatums = (Datum *) palloc(constraintNKeys * sizeof(Datum));
 		for (i = 0; i < constraintNKeys; i++)
 			opdatums[i] = ObjectIdGetDatum(exclOp[i]);
-		conexclopArray = construct_array(opdatums, constraintNKeys,
-										 OIDOID, sizeof(Oid), true, TYPALIGN_INT);
+		conexclopArray = construct_array_builtin(opdatums, constraintNKeys, OIDOID);
 	}
 	else
 		conexclopArray = NULL;
@@ -183,7 +191,7 @@ CreateConstraintEntry(const char *constraintName,
 	values[Anum_pg_constraint_confdeltype - 1] = CharGetDatum(foreignDeleteType);
 	values[Anum_pg_constraint_confmatchtype - 1] = CharGetDatum(foreignMatchType);
 	values[Anum_pg_constraint_conislocal - 1] = BoolGetDatum(conIsLocal);
-	values[Anum_pg_constraint_coninhcount - 1] = Int32GetDatum(conInhCount);
+	values[Anum_pg_constraint_coninhcount - 1] = Int16GetDatum(conInhCount);
 	values[Anum_pg_constraint_connoinherit - 1] = BoolGetDatum(conNoInherit);
 
 	if (conkeyArray)
@@ -210,6 +218,11 @@ CreateConstraintEntry(const char *constraintName,
 		values[Anum_pg_constraint_conffeqop - 1] = PointerGetDatum(conffeqopArray);
 	else
 		nulls[Anum_pg_constraint_conffeqop - 1] = true;
+
+	if (confdelsetcolsArray)
+		values[Anum_pg_constraint_confdelsetcols - 1] = PointerGetDatum(confdelsetcolsArray);
+	else
+		nulls[Anum_pg_constraint_confdelsetcols - 1] = true;
 
 	if (conexclopArray)
 		values[Anum_pg_constraint_conexclop - 1] = PointerGetDatum(conexclopArray);
@@ -551,6 +564,305 @@ ChooseConstraintName(const char *name1, const char *name2,
 }
 
 /*
+ * Find and return the pg_constraint tuple that implements a validated
+ * not-null constraint for the given column of the given relation.
+ *
+ * XXX This would be easier if we had pg_attribute.notnullconstr with the OID
+ * of the constraint that implements the not-null constraint for that column.
+ * I'm not sure it's worth the catalog bloat and de-normalization, however.
+ */
+HeapTuple
+findNotNullConstraintAttnum(Oid relid, AttrNumber attnum)
+{
+	Relation	pg_constraint;
+	HeapTuple	conTup,
+				retval = NULL;
+	SysScanDesc scan;
+	ScanKeyData key;
+
+	pg_constraint = table_open(ConstraintRelationId, AccessShareLock);
+	ScanKeyInit(&key,
+				Anum_pg_constraint_conrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	scan = systable_beginscan(pg_constraint, ConstraintRelidTypidNameIndexId,
+							  true, NULL, 1, &key);
+
+	while (HeapTupleIsValid(conTup = systable_getnext(scan)))
+	{
+		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(conTup);
+		AttrNumber	conkey;
+
+		/*
+		 * We're looking for a NOTNULL constraint that's marked validated,
+		 * with the column we're looking for as the sole element in conkey.
+		 */
+		if (con->contype != CONSTRAINT_NOTNULL)
+			continue;
+		if (!con->convalidated)
+			continue;
+
+		conkey = extractNotNullColumn(conTup);
+		if (conkey != attnum)
+			continue;
+
+		/* Found it */
+		retval = heap_copytuple(conTup);
+		break;
+	}
+
+	systable_endscan(scan);
+	table_close(pg_constraint, AccessShareLock);
+
+	return retval;
+}
+
+/*
+ * Find and return the pg_constraint tuple that implements a validated
+ * not-null constraint for the given column of the given relation.
+ */
+HeapTuple
+findNotNullConstraint(Oid relid, const char *colname)
+{
+	AttrNumber	attnum = get_attnum(relid, colname);
+
+	return findNotNullConstraintAttnum(relid, attnum);
+}
+
+/*
+ * Given a pg_constraint tuple for a not-null constraint, return the column
+ * number it is for.
+ */
+AttrNumber
+extractNotNullColumn(HeapTuple constrTup)
+{
+	AttrNumber	colnum;
+	Datum		adatum;
+	ArrayType  *arr;
+
+	/* only tuples for not-null constraints should be given */
+	Assert(((Form_pg_constraint) GETSTRUCT(constrTup))->contype == CONSTRAINT_NOTNULL);
+
+	adatum = SysCacheGetAttrNotNull(CONSTROID, constrTup,
+									Anum_pg_constraint_conkey);
+	arr = DatumGetArrayTypeP(adatum);	/* ensure not toasted */
+	if (ARR_NDIM(arr) != 1 ||
+		ARR_HASNULL(arr) ||
+		ARR_ELEMTYPE(arr) != INT2OID ||
+		ARR_DIMS(arr)[0] != 1)
+		elog(ERROR, "conkey is not a 1-D smallint array");
+
+	memcpy(&colnum, ARR_DATA_PTR(arr), sizeof(AttrNumber));
+
+	if ((Pointer) arr != DatumGetPointer(adatum))
+		pfree(arr);				/* free de-toasted copy, if any */
+
+	return colnum;
+}
+
+/*
+ * AdjustNotNullInheritance1
+ *		Adjust inheritance count for a single not-null constraint
+ *
+ * Adjust inheritance count, and possibly islocal status, for the not-null
+ * constraint row of the given column, if it exists, and return true.
+ * If no not-null constraint is found for the column, return false.
+ */
+bool
+AdjustNotNullInheritance1(Oid relid, AttrNumber attnum, int count,
+						  bool is_no_inherit)
+{
+	HeapTuple	tup;
+
+	tup = findNotNullConstraintAttnum(relid, attnum);
+	if (HeapTupleIsValid(tup))
+	{
+		Relation	pg_constraint;
+		Form_pg_constraint conform;
+
+		pg_constraint = table_open(ConstraintRelationId, RowExclusiveLock);
+		conform = (Form_pg_constraint) GETSTRUCT(tup);
+
+		/*
+		 * Don't let the NO INHERIT status change (but don't complain
+		 * unnecessarily.)  In the future it might be useful to let an
+		 * inheritable constraint replace a non-inheritable one, but we'd need
+		 * to recurse to children to get it added there.
+		 */
+		if (is_no_inherit != conform->connoinherit)
+			ereport(ERROR,
+					errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					errmsg("cannot change NO INHERIT status of inherited NOT NULL constraint \"%s\" on relation \"%s\"",
+						   NameStr(conform->conname), get_rel_name(relid)));
+
+		if (count > 0)
+			conform->coninhcount += count;
+
+		/* sanity check */
+		if (conform->coninhcount < 0)
+			elog(ERROR, "invalid inhcount %d for constraint \"%s\" on relation \"%s\"",
+				 conform->coninhcount, NameStr(conform->conname),
+				 get_rel_name(relid));
+
+		/*
+		 * If the constraint is no longer inherited, mark it local.  It's
+		 * arguable that we should drop it instead, but it's hard to see that
+		 * being better.  The user can drop it manually later.
+		 */
+		if (conform->coninhcount == 0)
+			conform->conislocal = true;
+
+		CatalogTupleUpdate(pg_constraint, &tup->t_self, tup);
+
+		table_close(pg_constraint, RowExclusiveLock);
+
+		return true;
+	}
+
+	return false;
+}
+
+/*
+ * AdjustNotNullInheritance
+ *		Adjust not-null constraints' inhcount/islocal for
+ *		ALTER TABLE [NO] INHERITS
+ *
+ * Mark the NOT NULL constraints for the given relation columns as
+ * inherited, so that they can't be dropped.
+ *
+ * Caller must have checked beforehand that attnotnull was set for all
+ * columns.  However, some of those could be set because of a primary
+ * key, so throw a proper user-visible error if one is not found.
+ */
+void
+AdjustNotNullInheritance(Oid relid, Bitmapset *columns, int count)
+{
+	Relation	pg_constraint;
+	int			attnum;
+
+	pg_constraint = table_open(ConstraintRelationId, RowExclusiveLock);
+
+	/*
+	 * Scan the set of columns and bump inhcount for each.
+	 */
+	attnum = -1;
+	while ((attnum = bms_next_member(columns, attnum)) >= 0)
+	{
+		HeapTuple	tup;
+		Form_pg_constraint conform;
+
+		tup = findNotNullConstraintAttnum(relid, attnum);
+		if (!HeapTupleIsValid(tup))
+			ereport(ERROR,
+					errcode(ERRCODE_DATATYPE_MISMATCH),
+					errmsg("column \"%s\" in child table must be marked NOT NULL",
+						   get_attname(relid, attnum,
+									   false)));
+
+		conform = (Form_pg_constraint) GETSTRUCT(tup);
+		conform->coninhcount += count;
+		if (conform->coninhcount < 0)
+			elog(ERROR, "invalid inhcount %d for constraint \"%s\" on relation \"%s\"",
+				 conform->coninhcount, NameStr(conform->conname),
+				 get_rel_name(relid));
+
+		/*
+		 * If the constraints are no longer inherited, mark them local.  It's
+		 * arguable that we should drop them instead, but it's hard to see
+		 * that being better.  The user can drop it manually later.
+		 */
+		if (conform->coninhcount == 0)
+			conform->conislocal = true;
+
+		CatalogTupleUpdate(pg_constraint, &tup->t_self, tup);
+	}
+
+	table_close(pg_constraint, RowExclusiveLock);
+}
+
+/*
+ * RelationGetNotNullConstraints
+ *		Return the list of not-null constraints for the given rel
+ *
+ * Caller can request cooked constraints, or raw.
+ *
+ * This is seldom needed, so we just scan pg_constraint each time.
+ *
+ * XXX This is only used to create derived tables, so NO INHERIT constraints
+ * are always skipped.
+ */
+List *
+RelationGetNotNullConstraints(Oid relid, bool cooked)
+{
+	List	   *notnulls = NIL;
+	Relation	constrRel;
+	HeapTuple	htup;
+	SysScanDesc conscan;
+	ScanKeyData skey;
+
+	constrRel = table_open(ConstraintRelationId, AccessShareLock);
+	ScanKeyInit(&skey,
+				Anum_pg_constraint_conrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	conscan = systable_beginscan(constrRel, ConstraintRelidTypidNameIndexId, true,
+								 NULL, 1, &skey);
+
+	while (HeapTupleIsValid(htup = systable_getnext(conscan)))
+	{
+		Form_pg_constraint conForm = (Form_pg_constraint) GETSTRUCT(htup);
+		AttrNumber	colnum;
+
+		if (conForm->contype != CONSTRAINT_NOTNULL)
+			continue;
+		if (conForm->connoinherit)
+			continue;
+
+		colnum = extractNotNullColumn(htup);
+
+		if (cooked)
+		{
+			CookedConstraint *cooked;
+
+			cooked = (CookedConstraint *) palloc(sizeof(CookedConstraint));
+
+			cooked->contype = CONSTR_NOTNULL;
+			cooked->name = pstrdup(NameStr(conForm->conname));
+			cooked->attnum = colnum;
+			cooked->expr = NULL;
+			cooked->skip_validation = false;
+			cooked->is_local = true;
+			cooked->inhcount = 0;
+			cooked->is_no_inherit = conForm->connoinherit;
+
+			notnulls = lappend(notnulls, cooked);
+		}
+		else
+		{
+			Constraint *constr;
+
+			constr = makeNode(Constraint);
+			constr->contype = CONSTR_NOTNULL;
+			constr->conname = pstrdup(NameStr(conForm->conname));
+			constr->deferrable = false;
+			constr->initdeferred = false;
+			constr->location = -1;
+			constr->keys = list_make1(makeString(get_attname(relid, colnum,
+															 false)));
+			constr->skip_validation = false;
+			constr->initially_valid = true;
+			notnulls = lappend(notnulls, constr);
+		}
+	}
+
+	systable_endscan(conscan);
+	table_close(constrRel, AccessShareLock);
+
+	return notnulls;
+}
+
+
+/*
  * Delete a single constraint record.
  */
 void
@@ -793,6 +1105,10 @@ ConstraintSetParentConstraint(Oid childConstrId,
 
 		constrForm->conislocal = false;
 		constrForm->coninhcount++;
+		if (constrForm->coninhcount < 0)
+			ereport(ERROR,
+					errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					errmsg("too many inheritance parents"));
 		constrForm->conparentid = parentConstrId;
 
 		CatalogTupleUpdate(constrRel, &tuple->t_self, newtup);
@@ -973,8 +1289,12 @@ get_relation_constraint_attnos(Oid relid, const char *conname,
 }
 
 /*
- * Return the OID of the constraint associated with the given index in the
+ * Return the OID of the constraint enforced by the given index in the
  * given relation; or InvalidOid if no such index is catalogued.
+ *
+ * Much like get_constraint_index, this function is concerned only with the
+ * one constraint that "owns" the given index.  Therefore, constraints of
+ * types other than unique, primary-key, and exclusion are ignored.
  */
 Oid
 get_relation_idx_constraint_oid(Oid relationId, Oid indexId)
@@ -999,6 +1319,13 @@ get_relation_idx_constraint_oid(Oid relationId, Oid indexId)
 		Form_pg_constraint constrForm;
 
 		constrForm = (Form_pg_constraint) GETSTRUCT(tuple);
+
+		/* See above */
+		if (constrForm->contype != CONSTRAINT_PRIMARY &&
+			constrForm->contype != CONSTRAINT_UNIQUE &&
+			constrForm->contype != CONSTRAINT_EXCLUSION)
+			continue;
+
 		if (constrForm->conindid == indexId)
 		{
 			constraintId = constrForm->oid;
@@ -1157,31 +1484,28 @@ get_primary_key_attnos(Oid relid, bool deferrableOk, Oid *constraintOid)
 /*
  * Extract data from the pg_constraint tuple of a foreign-key constraint.
  *
- * All arguments save the first are output arguments; the last three of them
- * can be passed as NULL if caller doesn't need them.
+ * All arguments save the first are output arguments.  All output arguments
+ * other than numfks, conkey and confkey can be passed as NULL if caller
+ * doesn't need them.
  */
 void
 DeconstructFkConstraintRow(HeapTuple tuple, int *numfks,
 						   AttrNumber *conkey, AttrNumber *confkey,
-						   Oid *pf_eq_oprs, Oid *pp_eq_oprs, Oid *ff_eq_oprs)
+						   Oid *pf_eq_oprs, Oid *pp_eq_oprs, Oid *ff_eq_oprs,
+						   int *num_fk_del_set_cols, AttrNumber *fk_del_set_cols)
 {
-	Oid			constrId;
 	Datum		adatum;
 	bool		isNull;
 	ArrayType  *arr;
 	int			numkeys;
-
-	constrId = ((Form_pg_constraint) GETSTRUCT(tuple))->oid;
 
 	/*
 	 * We expect the arrays to be 1-D arrays of the right types; verify that.
 	 * We don't need to use deconstruct_array() since the array data is just
 	 * going to look like a C array of values.
 	 */
-	adatum = SysCacheGetAttr(CONSTROID, tuple,
-							 Anum_pg_constraint_conkey, &isNull);
-	if (isNull)
-		elog(ERROR, "null conkey for constraint %u", constrId);
+	adatum = SysCacheGetAttrNotNull(CONSTROID, tuple,
+									Anum_pg_constraint_conkey);
 	arr = DatumGetArrayTypeP(adatum);	/* ensure not toasted */
 	if (ARR_NDIM(arr) != 1 ||
 		ARR_HASNULL(arr) ||
@@ -1194,10 +1518,8 @@ DeconstructFkConstraintRow(HeapTuple tuple, int *numfks,
 	if ((Pointer) arr != DatumGetPointer(adatum))
 		pfree(arr);				/* free de-toasted copy, if any */
 
-	adatum = SysCacheGetAttr(CONSTROID, tuple,
-							 Anum_pg_constraint_confkey, &isNull);
-	if (isNull)
-		elog(ERROR, "null confkey for constraint %u", constrId);
+	adatum = SysCacheGetAttrNotNull(CONSTROID, tuple,
+									Anum_pg_constraint_confkey);
 	arr = DatumGetArrayTypeP(adatum);	/* ensure not toasted */
 	if (ARR_NDIM(arr) != 1 ||
 		ARR_DIMS(arr)[0] != numkeys ||
@@ -1210,10 +1532,8 @@ DeconstructFkConstraintRow(HeapTuple tuple, int *numfks,
 
 	if (pf_eq_oprs)
 	{
-		adatum = SysCacheGetAttr(CONSTROID, tuple,
-								 Anum_pg_constraint_conpfeqop, &isNull);
-		if (isNull)
-			elog(ERROR, "null conpfeqop for constraint %u", constrId);
+		adatum = SysCacheGetAttrNotNull(CONSTROID, tuple,
+										Anum_pg_constraint_conpfeqop);
 		arr = DatumGetArrayTypeP(adatum);	/* ensure not toasted */
 		/* see TryReuseForeignKey if you change the test below */
 		if (ARR_NDIM(arr) != 1 ||
@@ -1228,10 +1548,8 @@ DeconstructFkConstraintRow(HeapTuple tuple, int *numfks,
 
 	if (pp_eq_oprs)
 	{
-		adatum = SysCacheGetAttr(CONSTROID, tuple,
-								 Anum_pg_constraint_conppeqop, &isNull);
-		if (isNull)
-			elog(ERROR, "null conppeqop for constraint %u", constrId);
+		adatum = SysCacheGetAttrNotNull(CONSTROID, tuple,
+										Anum_pg_constraint_conppeqop);
 		arr = DatumGetArrayTypeP(adatum);	/* ensure not toasted */
 		if (ARR_NDIM(arr) != 1 ||
 			ARR_DIMS(arr)[0] != numkeys ||
@@ -1245,10 +1563,8 @@ DeconstructFkConstraintRow(HeapTuple tuple, int *numfks,
 
 	if (ff_eq_oprs)
 	{
-		adatum = SysCacheGetAttr(CONSTROID, tuple,
-								 Anum_pg_constraint_conffeqop, &isNull);
-		if (isNull)
-			elog(ERROR, "null conffeqop for constraint %u", constrId);
+		adatum = SysCacheGetAttrNotNull(CONSTROID, tuple,
+										Anum_pg_constraint_conffeqop);
 		arr = DatumGetArrayTypeP(adatum);	/* ensure not toasted */
 		if (ARR_NDIM(arr) != 1 ||
 			ARR_DIMS(arr)[0] != numkeys ||
@@ -1258,6 +1574,32 @@ DeconstructFkConstraintRow(HeapTuple tuple, int *numfks,
 		memcpy(ff_eq_oprs, ARR_DATA_PTR(arr), numkeys * sizeof(Oid));
 		if ((Pointer) arr != DatumGetPointer(adatum))
 			pfree(arr);			/* free de-toasted copy, if any */
+	}
+
+	if (fk_del_set_cols)
+	{
+		adatum = SysCacheGetAttr(CONSTROID, tuple,
+								 Anum_pg_constraint_confdelsetcols, &isNull);
+		if (isNull)
+		{
+			*num_fk_del_set_cols = 0;
+		}
+		else
+		{
+			int			num_delete_cols;
+
+			arr = DatumGetArrayTypeP(adatum);	/* ensure not toasted */
+			if (ARR_NDIM(arr) != 1 ||
+				ARR_HASNULL(arr) ||
+				ARR_ELEMTYPE(arr) != INT2OID)
+				elog(ERROR, "confdelsetcols is not a 1-D smallint array");
+			num_delete_cols = ARR_DIMS(arr)[0];
+			memcpy(fk_del_set_cols, ARR_DATA_PTR(arr), num_delete_cols * sizeof(int16));
+			if ((Pointer) arr != DatumGetPointer(adatum))
+				pfree(arr);		/* free de-toasted copy, if any */
+
+			*num_fk_del_set_cols = num_delete_cols;
+		}
 	}
 
 	*numfks = numkeys;

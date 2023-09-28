@@ -261,7 +261,6 @@ static const TclExceptionNameMap exception_name_map[] = {
 /**********************************************************************
  * Forward declarations
  **********************************************************************/
-void		_PG_init(void);
 
 static void pltcl_init_interp(pltcl_interp_desc *interp_desc,
 							  Oid prolang, bool pltrusted);
@@ -474,6 +473,9 @@ _PG_init(void)
 							   PGC_SUSET, 0,
 							   NULL, NULL, NULL);
 
+	MarkGUCPrefixReserved("pltcl");
+	MarkGUCPrefixReserved("pltclu");
+
 	pltcl_pm_init_done = true;
 }
 
@@ -613,11 +615,11 @@ call_pltcl_start_proc(Oid prolang, bool pltrusted)
 	error_context_stack = &errcallback;
 
 	/* Parse possibly-qualified identifier and look up the function */
-	namelist = stringToQualifiedNameList(start_proc);
+	namelist = stringToQualifiedNameList(start_proc, NULL);
 	procOid = LookupFuncName(namelist, 0, NULL, false);
 
 	/* Current user must have permission to call function */
-	aclresult = pg_proc_aclcheck(procOid, GetUserId(), ACL_EXECUTE);
+	aclresult = object_aclcheck(ProcedureRelationId, procOid, GetUserId(), ACL_EXECUTE);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_FUNCTION, start_proc);
 
@@ -826,11 +828,15 @@ pltcl_func_handler(PG_FUNCTION_ARGS, pltcl_call_state *call_state,
 	{
 		ReturnSetInfo *rsi = (ReturnSetInfo *) fcinfo->resultinfo;
 
-		if (!rsi || !IsA(rsi, ReturnSetInfo) ||
-			(rsi->allowedModes & SFRM_Materialize) == 0)
+		if (!rsi || !IsA(rsi, ReturnSetInfo))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("set-valued function called in context that cannot accept a set")));
+
+		if (!(rsi->allowedModes & SFRM_Materialize))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("materialize mode required, but it is not allowed in this context")));
 
 		call_state->rsi = rsi;
 		call_state->tuple_store_cxt = rsi->econtext->ecxt_per_query_memory;
@@ -1236,7 +1242,6 @@ pltcl_trigger_handler(PG_FUNCTION_ARGS, pltcl_call_state *call_state,
 		for (i = 0; i < trigdata->tg_trigger->tgnargs; i++)
 			Tcl_ListObjAppendElement(NULL, tcl_cmd,
 									 Tcl_NewStringObj(utf_e2u(trigdata->tg_trigger->tgargs[i]), -1));
-
 	}
 	PG_CATCH();
 	{
@@ -1449,7 +1454,6 @@ compile_pltcl_function(Oid fn_oid, Oid tgreloid,
 		Form_pg_type typeStruct;
 		char		proc_internal_args[33 * FUNC_MAX_ARGS];
 		Datum		prosrcdatum;
-		bool		isnull;
 		char	   *proc_source;
 		char		buf[48];
 		Tcl_Interp *interp;
@@ -1668,10 +1672,8 @@ compile_pltcl_function(Oid fn_oid, Oid tgreloid,
 		/************************************************************
 		 * Add user's function definition to proc body
 		 ************************************************************/
-		prosrcdatum = SysCacheGetAttr(PROCOID, procTup,
-									  Anum_pg_proc_prosrc, &isnull);
-		if (isnull)
-			elog(ERROR, "null prosrc");
+		prosrcdatum = SysCacheGetAttrNotNull(PROCOID, procTup,
+											 Anum_pg_proc_prosrc);
 		proc_source = TextDatumGetCString(prosrcdatum);
 		UTF_BEGIN;
 		Tcl_DStringAppend(&proc_internal_body, UTF_E2U(proc_source), -1);
@@ -2436,6 +2438,7 @@ pltcl_process_SPI_result(Tcl_Interp *interp,
 		case SPI_OK_INSERT:
 		case SPI_OK_DELETE:
 		case SPI_OK_UPDATE:
+		case SPI_OK_MERGE:
 			Tcl_SetObjResult(interp, Tcl_NewWideIntObj(ntuples));
 			break;
 
@@ -2598,7 +2601,8 @@ pltcl_SPI_prepare(ClientData cdata, Tcl_Interp *interp,
 						typIOParam;
 			int32		typmod;
 
-			parseTypeString(Tcl_GetString(argsObj[i]), &typId, &typmod, false);
+			(void) parseTypeString(Tcl_GetString(argsObj[i]),
+								   &typId, &typmod, NULL);
 
 			getTypeInputInfo(typId, &typInput, &typIOParam);
 
@@ -2928,7 +2932,6 @@ pltcl_commit(ClientData cdata, Tcl_Interp *interp,
 	PG_TRY();
 	{
 		SPI_commit();
-		SPI_start_transaction();
 	}
 	PG_CATCH();
 	{
@@ -2968,7 +2971,6 @@ pltcl_rollback(ClientData cdata, Tcl_Interp *interp,
 	PG_TRY();
 	{
 		SPI_rollback();
-		SPI_start_transaction();
 	}
 	PG_CATCH();
 	{

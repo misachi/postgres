@@ -41,7 +41,7 @@
  *	  - SH_SCOPE - in which scope (e.g. extern, static inline) do function
  *		declarations reside
  *	  - SH_RAW_ALLOCATOR - if defined, memory contexts are not used; instead,
- *	    use this to allocate bytes
+ *	    use this to allocate bytes. The allocator must zero the returned space.
  *	  - SH_USE_NONDEFAULT_ALLOCATOR - if defined no element allocator functions
  *		are defined, so you can supply your own
  *	  The following parameters are only relevant when SH_DEFINE is defined:
@@ -86,6 +86,11 @@
  *	  presence is relevant to determine whether a lookup needs to continue
  *	  looking or is done - buckets following a deleted element are shifted
  *	  backwards, unless they're empty or already at their optimal position.
+ *
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ *
+ * src/include/lib/simplehash.h
  */
 
 #include "port/pg_bitutils.h"
@@ -198,8 +203,8 @@ SH_SCOPE void SH_DESTROY(SH_TYPE * tb);
 /* void <prefix>_reset(<prefix>_hash *tb) */
 SH_SCOPE void SH_RESET(SH_TYPE * tb);
 
-/* void <prefix>_grow(<prefix>_hash *tb) */
-SH_SCOPE void SH_GROW(SH_TYPE * tb, uint32 newsize);
+/* void <prefix>_grow(<prefix>_hash *tb, uint64 newsize) */
+SH_SCOPE void SH_GROW(SH_TYPE * tb, uint64 newsize);
 
 /* <element> *<prefix>_insert(<prefix>_hash *tb, <key> key, bool *found) */
 SH_SCOPE	SH_ELEMENT_TYPE *SH_INSERT(SH_TYPE * tb, SH_KEY_TYPE key, bool *found);
@@ -288,7 +293,7 @@ SH_SCOPE void SH_STAT(SH_TYPE * tb);
 #define SIMPLEHASH_H
 
 #ifdef FRONTEND
-#define sh_error(...) pg_log_error(__VA_ARGS__)
+#define sh_error(...) pg_fatal(__VA_ARGS__)
 #define sh_log(...) pg_log_info(__VA_ARGS__)
 #else
 #define sh_error(...) elog(ERROR, __VA_ARGS__)
@@ -302,7 +307,7 @@ SH_SCOPE void SH_STAT(SH_TYPE * tb);
  * the hashtable.
  */
 static inline void
-SH_COMPUTE_PARAMETERS(SH_TYPE * tb, uint32 newsize)
+SH_COMPUTE_PARAMETERS(SH_TYPE * tb, uint64 newsize)
 {
 	uint64		size;
 
@@ -317,16 +322,12 @@ SH_COMPUTE_PARAMETERS(SH_TYPE * tb, uint32 newsize)
 	 * Verify that allocation of ->data is possible on this platform, without
 	 * overflowing Size.
 	 */
-	if ((((uint64) sizeof(SH_ELEMENT_TYPE)) * size) >= SIZE_MAX / 2)
+	if (unlikely((((uint64) sizeof(SH_ELEMENT_TYPE)) * size) >= SIZE_MAX / 2))
 		sh_error("hash table too large");
 
 	/* now set size */
 	tb->size = size;
-
-	if (tb->size == SH_MAX_SIZE)
-		tb->sizemask = 0;
-	else
-		tb->sizemask = tb->size - 1;
+	tb->sizemask = (uint32) (size - 1);
 
 	/*
 	 * Compute the next threshold at which we need to grow the hash table
@@ -435,9 +436,9 @@ SH_CREATE(MemoryContext ctx, uint32 nelements, void *private_data)
 	uint64		size;
 
 #ifdef SH_RAW_ALLOCATOR
-	tb = SH_RAW_ALLOCATOR(sizeof(SH_TYPE));
+	tb = (SH_TYPE *) SH_RAW_ALLOCATOR(sizeof(SH_TYPE));
 #else
-	tb = MemoryContextAllocZero(ctx, sizeof(SH_TYPE));
+	tb = (SH_TYPE *) MemoryContextAllocZero(ctx, sizeof(SH_TYPE));
 	tb->ctx = ctx;
 #endif
 	tb->private_data = private_data;
@@ -447,7 +448,7 @@ SH_CREATE(MemoryContext ctx, uint32 nelements, void *private_data)
 
 	SH_COMPUTE_PARAMETERS(tb, size);
 
-	tb->data = SH_ALLOCATE(tb, sizeof(SH_ELEMENT_TYPE) * tb->size);
+	tb->data = (SH_ELEMENT_TYPE *) SH_ALLOCATE(tb, sizeof(SH_ELEMENT_TYPE) * tb->size);
 
 	return tb;
 }
@@ -476,7 +477,7 @@ SH_RESET(SH_TYPE * tb)
  * performance-wise, when known at some point.
  */
 SH_SCOPE void
-SH_GROW(SH_TYPE * tb, uint32 newsize)
+SH_GROW(SH_TYPE * tb, uint64 newsize)
 {
 	uint64		oldsize = tb->size;
 	SH_ELEMENT_TYPE *olddata = tb->data;
@@ -492,7 +493,7 @@ SH_GROW(SH_TYPE * tb, uint32 newsize)
 	/* compute parameters for new table */
 	SH_COMPUTE_PARAMETERS(tb, newsize);
 
-	tb->data = SH_ALLOCATE(tb, sizeof(SH_ELEMENT_TYPE) * tb->size);
+	tb->data = (SH_ELEMENT_TYPE *) SH_ALLOCATE(tb, sizeof(SH_ELEMENT_TYPE) * tb->size);
 
 	newdata = tb->data;
 
@@ -545,13 +546,13 @@ SH_GROW(SH_TYPE * tb, uint32 newsize)
 		if (oldentry->status == SH_STATUS_IN_USE)
 		{
 			uint32		hash;
-			uint32		startelem;
+			uint32		startelem2;
 			uint32		curelem;
 			SH_ELEMENT_TYPE *newentry;
 
 			hash = SH_ENTRY_HASH(tb, oldentry);
-			startelem = SH_INITIAL_BUCKET(tb, hash);
-			curelem = startelem;
+			startelem2 = SH_INITIAL_BUCKET(tb, hash);
+			curelem = startelem2;
 
 			/* find empty element to put data into */
 			while (true)
@@ -563,7 +564,7 @@ SH_GROW(SH_TYPE * tb, uint32 newsize)
 					break;
 				}
 
-				curelem = SH_NEXT(tb, curelem, startelem);
+				curelem = SH_NEXT(tb, curelem, startelem2);
 			}
 
 			/* copy entry to new slot */
@@ -606,10 +607,8 @@ restart:
 	 */
 	if (unlikely(tb->members >= tb->grow_threshold))
 	{
-		if (tb->size == SH_MAX_SIZE)
-		{
+		if (unlikely(tb->size == SH_MAX_SIZE))
 			sh_error("hash table size exceeded");
-		}
 
 		/*
 		 * When optimizing, it can be very useful to print these out.
@@ -811,7 +810,7 @@ SH_LOOKUP_HASH_INTERNAL(SH_TYPE * tb, SH_KEY_TYPE key, uint32 hash)
 }
 
 /*
- * Lookup up entry in hash table.  Returns NULL if key not present.
+ * Lookup entry in hash table.  Returns NULL if key not present.
  */
 SH_SCOPE	SH_ELEMENT_TYPE *
 SH_LOOKUP(SH_TYPE * tb, SH_KEY_TYPE key)
@@ -822,7 +821,7 @@ SH_LOOKUP(SH_TYPE * tb, SH_KEY_TYPE key)
 }
 
 /*
- * Lookup up entry in hash table using an already-calculated hash.
+ * Lookup entry in hash table using an already-calculated hash.
  *
  * Returns NULL if key not present.
  */
@@ -965,7 +964,6 @@ SH_DELETE_ITEM(SH_TYPE * tb, SH_ELEMENT_TYPE * entry)
 SH_SCOPE void
 SH_START_ITERATE(SH_TYPE * tb, SH_ITERATOR * iter)
 {
-	int			i;
 	uint64		startelem = PG_UINT64_MAX;
 
 	/*
@@ -973,7 +971,7 @@ SH_START_ITERATE(SH_TYPE * tb, SH_ITERATOR * iter)
 	 * supported, we want to start/end at an element that cannot be affected
 	 * by elements being shifted.
 	 */
-	for (i = 0; i < tb->size; i++)
+	for (uint32 i = 0; i < tb->size; i++)
 	{
 		SH_ELEMENT_TYPE *entry = &tb->data[i];
 
@@ -984,6 +982,7 @@ SH_START_ITERATE(SH_TYPE * tb, SH_ITERATOR * iter)
 		}
 	}
 
+	/* we should have found an empty element */
 	Assert(startelem < SH_MAX_SIZE);
 
 	/*
@@ -1060,7 +1059,7 @@ SH_STAT(SH_TYPE * tb)
 	double		fillfactor;
 	uint32		i;
 
-	uint32	   *collisions = palloc0(tb->size * sizeof(uint32));
+	uint32	   *collisions = (uint32 *) palloc0(tb->size * sizeof(uint32));
 	uint32		total_collisions = 0;
 	uint32		max_collisions = 0;
 	double		avg_collisions;
@@ -1115,7 +1114,7 @@ SH_STAT(SH_TYPE * tb)
 		avg_collisions = 0;
 	}
 
-	sh_log("size: " UINT64_FORMAT ", members: %u, filled: %f, total chain: %u, max chain: %u, avg chain: %f, total_collisions: %u, max_collisions: %i, avg_collisions: %f",
+	sh_log("size: " UINT64_FORMAT ", members: %u, filled: %f, total chain: %u, max chain: %u, avg chain: %f, total_collisions: %u, max_collisions: %u, avg_collisions: %f",
 		   tb->size, tb->members, fillfactor, total_chain_length, max_chain_length, avg_chain_length,
 		   total_collisions, max_collisions, avg_collisions);
 }

@@ -3,7 +3,7 @@
  * toast_internals.c
  *	  Functions for internal use by the TOAST system.
  *
- * Copyright (c) 2000-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/access/common/toast_internals.c
@@ -53,9 +53,11 @@ toast_compress_datum(Datum value, char cmethod)
 	Assert(!VARATT_IS_EXTERNAL(DatumGetPointer(value)));
 	Assert(!VARATT_IS_COMPRESSED(DatumGetPointer(value)));
 
-	Assert(CompressionMethodIsValid(cmethod));
-
 	valsize = VARSIZE_ANY_EXHDR(DatumGetPointer(value));
+
+	/* If the compression method is not valid, use the current default */
+	if (!CompressionMethodIsValid(cmethod))
+		cmethod = default_toast_compression;
 
 	/*
 	 * Call appropriate compression routine for the compression method.
@@ -357,10 +359,12 @@ toast_save_datum(Relation rel, Datum value,
 	}
 
 	/*
-	 * Done - close toast relation and its indexes
+	 * Done - close toast relation and its indexes but keep the lock until
+	 * commit, so as a concurrent reindex done directly on the toast relation
+	 * would be able to wait for this transaction.
 	 */
-	toast_close_indexes(toastidxs, num_indexes, RowExclusiveLock);
-	table_close(toastrel, RowExclusiveLock);
+	toast_close_indexes(toastidxs, num_indexes, NoLock);
+	table_close(toastrel, NoLock);
 
 	/*
 	 * Create the TOAST pointer value that we'll return
@@ -437,11 +441,13 @@ toast_delete_datum(Relation rel, Datum value, bool is_speculative)
 	}
 
 	/*
-	 * End scan and close relations
+	 * End scan and close relations but keep the lock until commit, so as a
+	 * concurrent reindex done directly on the toast relation would be able to
+	 * wait for this transaction.
 	 */
 	systable_endscan_ordered(toastscan);
-	toast_close_indexes(toastidxs, num_indexes, RowExclusiveLock);
-	table_close(toastrel, RowExclusiveLock);
+	toast_close_indexes(toastidxs, num_indexes, NoLock);
+	table_close(toastrel, NoLock);
 }
 
 /* ----------
@@ -630,16 +636,37 @@ toast_close_indexes(Relation *toastidxs, int num_indexes, LOCKMODE lock)
  *
  *	Initialize an appropriate TOAST snapshot.  We must use an MVCC snapshot
  *	to initialize the TOAST snapshot; since we don't know which one to use,
- *	just use the oldest one.  This is safe: at worst, we will get a "snapshot
- *	too old" error that might have been avoided otherwise.
+ *	just use the oldest one.
  */
 void
 init_toast_snapshot(Snapshot toast_snapshot)
 {
 	Snapshot	snapshot = GetOldestSnapshot();
 
+	/*
+	 * GetOldestSnapshot returns NULL if the session has no active snapshots.
+	 * We can get that if, for example, a procedure fetches a toasted value
+	 * into a local variable, commits, and then tries to detoast the value.
+	 * Such coding is unsafe, because once we commit there is nothing to
+	 * prevent the toast data from being deleted.  Detoasting *must* happen in
+	 * the same transaction that originally fetched the toast pointer.  Hence,
+	 * rather than trying to band-aid over the problem, throw an error.  (This
+	 * is not very much protection, because in many scenarios the procedure
+	 * would have already created a new transaction snapshot, preventing us
+	 * from detecting the problem.  But it's better than nothing, and for sure
+	 * we shouldn't expend code on masking the problem more.)
+	 */
 	if (snapshot == NULL)
-		elog(ERROR, "no known snapshots");
+		elog(ERROR, "cannot fetch toast data without an active snapshot");
+
+	/*
+	 * Catalog snapshots can be returned by GetOldestSnapshot() even if not
+	 * registered or active. That easily hides bugs around not having a
+	 * snapshot set up - most of the time there is a valid catalog snapshot.
+	 * So additionally insist that the current snapshot is registered or
+	 * active.
+	 */
+	Assert(HaveRegisteredOrActiveSnapshot());
 
 	InitToastSnapshot(*toast_snapshot, snapshot->lsn, snapshot->whenTaken);
 }

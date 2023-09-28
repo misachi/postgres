@@ -8,7 +8,7 @@
  * should end up here.
  *
  *
- * Copyright (c) 2016-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/jit/jit.c
@@ -185,6 +185,7 @@ InstrJitAgg(JitInstrumentation *dst, JitInstrumentation *add)
 {
 	dst->created_functions += add->created_functions;
 	INSTR_TIME_ADD(dst->generation_counter, add->generation_counter);
+	INSTR_TIME_ADD(dst->deform_counter, add->deform_counter);
 	INSTR_TIME_ADD(dst->inlining_counter, add->inlining_counter);
 	INSTR_TIME_ADD(dst->optimization_counter, add->optimization_counter);
 	INSTR_TIME_ADD(dst->emission_counter, add->emission_counter);
@@ -195,10 +196,10 @@ file_exists(const char *name)
 {
 	struct stat st;
 
-	AssertArg(name != NULL);
+	Assert(name != NULL);
 
 	if (stat(name, &st) == 0)
-		return S_ISDIR(st.st_mode) ? false : true;
+		return !S_ISDIR(st.st_mode);
 	else if (!(errno == ENOENT || errno == ENOTDIR))
 		ereport(ERROR,
 				(errcode_for_file_access(),

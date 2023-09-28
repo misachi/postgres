@@ -49,6 +49,8 @@ INSERT INTO TIMESTAMP_TBL VALUES ('-infinity');
 INSERT INTO TIMESTAMP_TBL VALUES ('infinity');
 INSERT INTO TIMESTAMP_TBL VALUES ('epoch');
 
+SELECT timestamp 'infinity' = timestamp '+infinity' AS t;
+
 -- Postgres v6.0 standard output format
 INSERT INTO TIMESTAMP_TBL VALUES ('Mon Feb 10 17:32:01 1997 PST');
 
@@ -93,6 +95,13 @@ INSERT INTO TIMESTAMP_TBL VALUES ('1997.041 17:32:01 UTC');
 INSERT INTO TIMESTAMP_TBL VALUES ('19970210 173201 America/New_York');
 -- this fails (even though TZ is a no-op, we still look it up)
 INSERT INTO TIMESTAMP_TBL VALUES ('19970710 173201 America/Does_not_exist');
+
+-- Test non-error-throwing API
+SELECT pg_input_is_valid('now', 'timestamp');
+SELECT pg_input_is_valid('garbage', 'timestamp');
+SELECT pg_input_is_valid('2001-01-01 00:00 Nehwon/Lankhmar', 'timestamp');
+SELECT * FROM pg_input_error_info('garbage', 'timestamp');
+SELECT * FROM pg_input_error_info('2001-01-01 00:00 Nehwon/Lankhmar', 'timestamp');
 
 -- Check date conversion and date arithmetic
 INSERT INTO TIMESTAMP_TBL VALUES ('1997-06-10 18:32:01 PDT');
@@ -263,6 +272,12 @@ SELECT date_bin('5 min'::interval, timestamp '2020-02-01 01:01:01', timestamp '2
 SELECT date_bin('5 months'::interval, timestamp '2020-02-01 01:01:01', timestamp '2001-01-01');
 SELECT date_bin('5 years'::interval,  timestamp '2020-02-01 01:01:01', timestamp '2001-01-01');
 
+-- disallow zero intervals
+SELECT date_bin('0 days'::interval, timestamp '1970-01-01 01:00:00' , timestamp '1970-01-01 00:00:00');
+
+-- disallow negative intervals
+SELECT date_bin('-2 days'::interval, timestamp '1970-01-01 01:00:00' , timestamp '1970-01-01 00:00:00');
+
 -- Test casting within a BETWEEN qualifier
 SELECT d1 - timestamp without time zone '1997-01-02' AS diff
   FROM TIMESTAMP_TBL
@@ -310,6 +325,10 @@ SELECT date_part('epoch', '294270-01-01 00:00:00'::timestamp);
 SELECT extract(epoch from '294270-01-01 00:00:00'::timestamp);
 -- another internal overflow test case
 SELECT extract(epoch from '5000-01-01 00:00:00'::timestamp);
+
+-- test edge-case overflow in timestamp subtraction
+SELECT timestamp '294276-12-31 23:59:59' - timestamp '1999-12-23 19:59:04.224193' AS ok;
+SELECT timestamp '294276-12-31 23:59:59' - timestamp '1999-12-23 19:59:04.224192' AS overflows;
 
 -- TO_CHAR()
 SELECT to_char(d1, 'DAY Day day DY Dy dy MONTH Month month RM MON Mon mon')
@@ -364,3 +383,17 @@ SELECT make_timestamp(2014, 12, 28, 6, 30, 45.887);
 SELECT make_timestamp(-44, 3, 15, 12, 30, 15);
 -- should fail
 select make_timestamp(0, 7, 15, 12, 30, 15);
+
+-- generate_series for timestamp
+select * from generate_series('2020-01-01 00:00'::timestamp,
+                              '2020-01-02 03:00'::timestamp,
+                              '1 hour'::interval);
+-- the LIMIT should allow this to terminate in a reasonable amount of time
+-- (but that unfortunately doesn't work yet for SELECT * FROM ...)
+select generate_series('2022-01-01 00:00'::timestamp,
+                       'infinity'::timestamp,
+                       '1 month'::interval) limit 10;
+-- errors
+select * from generate_series('2020-01-01 00:00'::timestamp,
+                              '2020-01-02 03:00'::timestamp,
+                              '0 hour'::interval);

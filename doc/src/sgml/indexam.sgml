@@ -45,7 +45,8 @@
    extant versions of the same logical row; to an index, each tuple is
    an independent object that needs its own index entry.  Thus, an
    update of a row always creates all-new index entries for the row, even if
-   the key values did not change.  (HOT tuples are an exception to this
+   the key values did not change.  (<link linkend="storage-hot">HOT
+   tuples</link> are an exception to this
    statement; but indexes do not deal with those, either.)  Index entries for
    dead tuples are reclaimed (by vacuuming) when the dead tuples themselves
    are reclaimed.
@@ -126,6 +127,9 @@ typedef struct IndexAmRoutine
     bool        amcaninclude;
     /* does AM use maintenance_work_mem? */
     bool        amusemaintenanceworkmem;
+    /* does AM summarize tuples, with at least all tuples in the block
+     * summarized in one summary */
+    bool        amsummarizing;
     /* OR of parallel vacuum flags */
     uint8       amparallelvacuumoptions;
     /* type of data stored in index, or InvalidOid if variable */
@@ -246,6 +250,16 @@ typedef struct IndexAmRoutine
    null, independently of <structfield>amoptionalkey</structfield>.
   </para>
 
+  <para>
+   The <structfield>amsummarizing</structfield> flag indicates whether the
+   access method summarizes the indexed tuples, with summarizing granularity
+   of at least per block.
+   Access methods that do not point to individual tuples, but to block ranges
+   (like <acronym>BRIN</acronym>), may allow the <acronym>HOT</acronym> optimization
+   to continue. This does not apply to attributes referenced in index
+   predicates, an update of such an attribute always disables <acronym>HOT</acronym>.
+  </para>
+
  </sect1>
 
  <sect1 id="index-functions">
@@ -310,7 +324,7 @@ aminsert (Relation indexRelation,
   </para>
 
   <para>
-   The <literal>indexUnchanged</literal> boolean value gives a hint
+   The <literal>indexUnchanged</literal> Boolean value gives a hint
    about the nature of the tuple to be indexed.  When it is true,
    the tuple is a duplicate of some existing tuple in the index.  The
    new tuple is a logically unchanged successor MVCC tuple version.  This
@@ -338,7 +352,7 @@ aminsert (Relation indexRelation,
 
   <para>
    If the index AM wishes to cache data across successive index insertions
-   within a SQL statement, it can allocate space
+   within an SQL statement, it can allocate space
    in <literal>indexInfo-&gt;ii_Context</literal> and store a pointer to the
    data in <literal>indexInfo-&gt;ii_AmCache</literal> (which will be NULL
    initially).
@@ -493,7 +507,7 @@ amproperty (Oid index_oid, int attno,
    code, it's better to inspect <parameter>prop</parameter>.
    If the <structfield>amproperty</structfield> method returns <literal>true</literal> then
    it has determined the property test result: it must set <literal>*res</literal>
-   to the boolean value to return, or set <literal>*isnull</literal>
+   to the Boolean value to return, or set <literal>*isnull</literal>
    to <literal>true</literal> to return a NULL.  (Both of the referenced variables
    are initialized to <literal>false</literal> before the call.)
    If the <structfield>amproperty</structfield> method returns <literal>false</literal> then
@@ -629,7 +643,7 @@ amrescan (IndexScanDesc scan,
 
   <para>
 <programlisting>
-boolean
+bool
 amgettuple (IndexScanDesc scan,
             ScanDirection direction);
 </programlisting>

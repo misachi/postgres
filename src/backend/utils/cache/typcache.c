@@ -31,7 +31,7 @@
  * constraint changes are also tracked properly.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -60,6 +60,7 @@
 #include "executor/executor.h"
 #include "lib/dshash.h"
 #include "optimizer/optimizer.h"
+#include "port/pg_bitutils.h"
 #include "storage/lwlock.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
@@ -272,10 +273,15 @@ static const dshash_parameters srtr_typmod_table_params = {
 /* hashtable for recognizing registered record types */
 static HTAB *RecordCacheHash = NULL;
 
-/* arrays of info about registered record types, indexed by assigned typmod */
-static TupleDesc *RecordCacheArray = NULL;
-static uint64 *RecordIdentifierArray = NULL;
-static int32 RecordCacheArrayLen = 0;	/* allocated length of above arrays */
+typedef struct RecordCacheArrayEntry
+{
+	uint64		id;
+	TupleDesc	tupdesc;
+} RecordCacheArrayEntry;
+
+/* array of info about registered record types, indexed by assigned typmod */
+static RecordCacheArrayEntry *RecordCacheArray = NULL;
+static int32 RecordCacheArrayLen = 0;	/* allocated length of above array */
 static int32 NextRecordTypmod = 0;	/* number of entries used */
 
 /*
@@ -363,7 +369,7 @@ lookup_type_cache(Oid type_id, int flags)
 
 	/* Try to look up an existing entry */
 	typentry = (TypeCacheEntry *) hash_search(TypeCacheHash,
-											  (void *) &type_id,
+											  &type_id,
 											  HASH_FIND, NULL);
 	if (typentry == NULL)
 	{
@@ -391,7 +397,7 @@ lookup_type_cache(Oid type_id, int flags)
 
 		/* Now make the typcache entry */
 		typentry = (TypeCacheEntry *) hash_search(TypeCacheHash,
-												  (void *) &type_id,
+												  &type_id,
 												  HASH_ENTER, &found);
 		Assert(!found);			/* it wasn't there a moment ago */
 
@@ -1514,14 +1520,17 @@ cache_record_field_properties(TypeCacheEntry *typentry)
 	/*
 	 * For type RECORD, we can't really tell what will work, since we don't
 	 * have access here to the specific anonymous type.  Just assume that
-	 * everything will (we may get a failure at runtime ...)
+	 * equality and comparison will (we may get a failure at runtime).  We
+	 * could also claim that hashing works, but then if code that has the
+	 * option between a comparison-based (sort-based) and a hash-based plan
+	 * chooses hashing, stuff could fail that would otherwise work if it chose
+	 * a comparison-based plan.  In practice more types support comparison
+	 * than hashing.
 	 */
 	if (typentry->type_id == RECORDOID)
 	{
 		typentry->flags |= (TCFLAGS_HAVE_FIELD_EQUALITY |
-							TCFLAGS_HAVE_FIELD_COMPARE |
-							TCFLAGS_HAVE_FIELD_HASHING |
-							TCFLAGS_HAVE_FIELD_EXTENDED_HASHING);
+							TCFLAGS_HAVE_FIELD_COMPARE);
 	}
 	else if (typentry->typtype == TYPTYPE_COMPOSITE)
 	{
@@ -1699,28 +1708,20 @@ ensure_record_cache_typmod_slot_exists(int32 typmod)
 {
 	if (RecordCacheArray == NULL)
 	{
-		RecordCacheArray = (TupleDesc *)
-			MemoryContextAllocZero(CacheMemoryContext, 64 * sizeof(TupleDesc));
-		RecordIdentifierArray = (uint64 *)
-			MemoryContextAllocZero(CacheMemoryContext, 64 * sizeof(uint64));
+		RecordCacheArray = (RecordCacheArrayEntry *)
+			MemoryContextAllocZero(CacheMemoryContext,
+								   64 * sizeof(RecordCacheArrayEntry));
 		RecordCacheArrayLen = 64;
 	}
 
 	if (typmod >= RecordCacheArrayLen)
 	{
-		int32		newlen = RecordCacheArrayLen * 2;
+		int32		newlen = pg_nextpower2_32(typmod + 1);
 
-		while (typmod >= newlen)
-			newlen *= 2;
-
-		RecordCacheArray = (TupleDesc *) repalloc(RecordCacheArray,
-												  newlen * sizeof(TupleDesc));
-		memset(RecordCacheArray + RecordCacheArrayLen, 0,
-			   (newlen - RecordCacheArrayLen) * sizeof(TupleDesc));
-		RecordIdentifierArray = (uint64 *) repalloc(RecordIdentifierArray,
-													newlen * sizeof(uint64));
-		memset(RecordIdentifierArray + RecordCacheArrayLen, 0,
-			   (newlen - RecordCacheArrayLen) * sizeof(uint64));
+		RecordCacheArray = repalloc0_array(RecordCacheArray,
+										   RecordCacheArrayEntry,
+										   RecordCacheArrayLen,
+										   newlen);
 		RecordCacheArrayLen = newlen;
 	}
 }
@@ -1758,8 +1759,8 @@ lookup_rowtype_tupdesc_internal(Oid type_id, int32 typmod, bool noError)
 		{
 			/* It is already in our local cache? */
 			if (typmod < RecordCacheArrayLen &&
-				RecordCacheArray[typmod] != NULL)
-				return RecordCacheArray[typmod];
+				RecordCacheArray[typmod].tupdesc != NULL)
+				return RecordCacheArray[typmod].tupdesc;
 
 			/* Are we attached to a shared record typmod registry? */
 			if (CurrentSession->shared_typmod_registry != NULL)
@@ -1785,19 +1786,19 @@ lookup_rowtype_tupdesc_internal(Oid type_id, int32 typmod, bool noError)
 					 * Our local array can now point directly to the TupleDesc
 					 * in shared memory, which is non-reference-counted.
 					 */
-					RecordCacheArray[typmod] = tupdesc;
+					RecordCacheArray[typmod].tupdesc = tupdesc;
 					Assert(tupdesc->tdrefcount == -1);
 
 					/*
 					 * We don't share tupdesc identifiers across processes, so
 					 * assign one locally.
 					 */
-					RecordIdentifierArray[typmod] = ++tupledesc_id_counter;
+					RecordCacheArray[typmod].id = ++tupledesc_id_counter;
 
 					dshash_release_lock(CurrentSession->shared_typmod_table,
 										entry);
 
-					return RecordCacheArray[typmod];
+					return RecordCacheArray[typmod].tupdesc;
 				}
 			}
 		}
@@ -1819,8 +1820,11 @@ lookup_rowtype_tupdesc_internal(Oid type_id, int32 typmod, bool noError)
  * for example from record_in().)
  *
  * Note: on success, we increment the refcount of the returned TupleDesc,
- * and log the reference in CurrentResourceOwner.  Caller should call
- * ReleaseTupleDesc or DecrTupleDescRefCount when done using the tupdesc.
+ * and log the reference in CurrentResourceOwner.  Caller must call
+ * ReleaseTupleDesc when done using the tupdesc.  (There are some
+ * cases in which the returned tupdesc is not refcounted, in which
+ * case PinTupleDesc/ReleaseTupleDesc are no-ops; but in these cases
+ * the tupdesc is guaranteed to live till process exit.)
  */
 TupleDesc
 lookup_rowtype_tupdesc(Oid type_id, int32 typmod)
@@ -1970,10 +1974,14 @@ assign_record_type_typmod(TupleDesc tupDesc)
 			CreateCacheMemoryContext();
 	}
 
-	/* Find or create a hashtable entry for this tuple descriptor */
+	/*
+	 * Find a hashtable entry for this tuple descriptor. We don't use
+	 * HASH_ENTER yet, because if it's missing, we need to make sure that all
+	 * the allocations succeed before we create the new entry.
+	 */
 	recentry = (RecordCacheEntry *) hash_search(RecordCacheHash,
-												(void *) &tupDesc,
-												HASH_ENTER, &found);
+												&tupDesc,
+												HASH_FIND, &found);
 	if (found && recentry->tupdesc != NULL)
 	{
 		tupDesc->tdtypmod = recentry->tupdesc->tdtypmod;
@@ -1981,24 +1989,38 @@ assign_record_type_typmod(TupleDesc tupDesc)
 	}
 
 	/* Not present, so need to manufacture an entry */
-	recentry->tupdesc = NULL;
 	oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
 
 	/* Look in the SharedRecordTypmodRegistry, if attached */
 	entDesc = find_or_make_matching_shared_tupledesc(tupDesc);
 	if (entDesc == NULL)
 	{
+		/*
+		 * Make sure we have room before we CreateTupleDescCopy() or advance
+		 * NextRecordTypmod.
+		 */
+		ensure_record_cache_typmod_slot_exists(NextRecordTypmod);
+
 		/* Reference-counted local cache only. */
 		entDesc = CreateTupleDescCopy(tupDesc);
 		entDesc->tdrefcount = 1;
 		entDesc->tdtypmod = NextRecordTypmod++;
 	}
-	ensure_record_cache_typmod_slot_exists(entDesc->tdtypmod);
-	RecordCacheArray[entDesc->tdtypmod] = entDesc;
-	recentry->tupdesc = entDesc;
+	else
+	{
+		ensure_record_cache_typmod_slot_exists(entDesc->tdtypmod);
+	}
+
+	RecordCacheArray[entDesc->tdtypmod].tupdesc = entDesc;
 
 	/* Assign a unique tupdesc identifier, too. */
-	RecordIdentifierArray[entDesc->tdtypmod] = ++tupledesc_id_counter;
+	RecordCacheArray[entDesc->tdtypmod].id = ++tupledesc_id_counter;
+
+	/* Fully initialized; create the hash table entry */
+	recentry = (RecordCacheEntry *) hash_search(RecordCacheHash,
+												&tupDesc,
+												HASH_ENTER, NULL);
+	recentry->tupdesc = entDesc;
 
 	/* Update the caller's tuple descriptor. */
 	tupDesc->tdtypmod = entDesc->tdtypmod;
@@ -2041,10 +2063,10 @@ assign_record_type_identifier(Oid type_id, int32 typmod)
 		 * It's a transient record type, so look in our record-type table.
 		 */
 		if (typmod >= 0 && typmod < RecordCacheArrayLen &&
-			RecordCacheArray[typmod] != NULL)
+			RecordCacheArray[typmod].tupdesc != NULL)
 		{
-			Assert(RecordIdentifierArray[typmod] != 0);
-			return RecordIdentifierArray[typmod];
+			Assert(RecordCacheArray[typmod].id != 0);
+			return RecordCacheArray[typmod].id;
 		}
 
 		/* For anonymous or unrecognized record type, generate a new ID */
@@ -2124,7 +2146,7 @@ SharedRecordTypmodRegistryInit(SharedRecordTypmodRegistry *registry,
 		TupleDesc	tupdesc;
 		bool		found;
 
-		tupdesc = RecordCacheArray[typmod];
+		tupdesc = RecordCacheArray[typmod].tupdesc;
 		if (tupdesc == NULL)
 			continue;
 
@@ -2822,7 +2844,7 @@ find_or_make_matching_shared_tupledesc(TupleDesc tupdesc)
 		Assert(record_table_entry->key.shared);
 		result = (TupleDesc)
 			dsa_get_address(CurrentSession->area,
-							record_table_entry->key.shared);
+							record_table_entry->key.u.shared_tupdesc);
 		Assert(result->tdrefcount == -1);
 
 		return result;

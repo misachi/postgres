@@ -60,7 +60,7 @@
  * values.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -71,6 +71,7 @@
 
 #include "postgres.h"
 
+#include <limits.h>
 #include <math.h>
 
 #include "access/amapi.h"
@@ -79,7 +80,7 @@
 #include "executor/executor.h"
 #include "executor/nodeAgg.h"
 #include "executor/nodeHash.h"
-#include "executor/nodeResultCache.h"
+#include "executor/nodeMemoize.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -123,6 +124,7 @@ double		cpu_index_tuple_cost = DEFAULT_CPU_INDEX_TUPLE_COST;
 double		cpu_operator_cost = DEFAULT_CPU_OPERATOR_COST;
 double		parallel_tuple_cost = DEFAULT_PARALLEL_TUPLE_COST;
 double		parallel_setup_cost = DEFAULT_PARALLEL_SETUP_COST;
+double		recursive_worktable_factor = DEFAULT_RECURSIVE_WORKTABLE_FACTOR;
 
 int			effective_cache_size = DEFAULT_EFFECTIVE_CACHE_SIZE;
 
@@ -140,7 +142,7 @@ bool		enable_incremental_sort = true;
 bool		enable_hashagg = true;
 bool		enable_nestloop = true;
 bool		enable_material = true;
-bool		enable_resultcache = true;
+bool		enable_memoize = true;
 bool		enable_mergejoin = true;
 bool		enable_hashjoin = true;
 bool		enable_gathermerge = true;
@@ -149,6 +151,7 @@ bool		enable_partitionwise_aggregate = false;
 bool		enable_parallel_append = true;
 bool		enable_parallel_hash = true;
 bool		enable_partition_pruning = true;
+bool		enable_presorted_aggregate = true;
 bool		enable_async_append = true;
 
 typedef struct
@@ -167,7 +170,7 @@ static bool cost_qual_eval_walker(Node *node, cost_qual_eval_context *context);
 static void get_restriction_qual_cost(PlannerInfo *root, RelOptInfo *baserel,
 									  ParamPathInfo *param_info,
 									  QualCost *qpqual_cost);
-static bool has_indexed_join_quals(NestPath *joinpath);
+static bool has_indexed_join_quals(NestPath *path);
 static double approx_tuple_count(PlannerInfo *root, JoinPath *path,
 								 List *quals);
 static double calc_joinrel_size_estimate(PlannerInfo *root,
@@ -186,6 +189,7 @@ static Selectivity get_foreign_key_join_selectivity(PlannerInfo *root,
 static Cost append_nonpartial_cost(List *subpaths, int numpaths,
 								   int parallel_workers);
 static void set_rel_width(PlannerInfo *root, RelOptInfo *rel);
+static int32 get_expr_width(PlannerInfo *root, const Node *expr);
 static double relation_byte_size(double tuples, int width);
 static double page_size(double tuples, int width);
 static double get_parallel_divisor(Path *path);
@@ -212,6 +216,32 @@ clamp_row_est(double nrows)
 		nrows = rint(nrows);
 
 	return nrows;
+}
+
+/*
+ * clamp_cardinality_to_long
+ *		Cast a Cardinality value to a sane long value.
+ */
+long
+clamp_cardinality_to_long(Cardinality x)
+{
+	/*
+	 * Just for paranoia's sake, ensure we do something sane with negative or
+	 * NaN values.
+	 */
+	if (isnan(x))
+		return LONG_MAX;
+	if (x <= 0)
+		return 0;
+
+	/*
+	 * If "long" is 64 bits, then LONG_MAX cannot be represented exactly as a
+	 * double.  Casting it to double and back may well result in overflow due
+	 * to rounding, so avoid doing that.  We trust that any double value that
+	 * compares strictly less than "(double) LONG_MAX" will cast to a
+	 * representable "long" value.
+	 */
+	return (x < (double) LONG_MAX) ? (long) x : LONG_MAX;
 }
 
 
@@ -1387,13 +1417,16 @@ cost_tidrangescan(Path *path, PlannerInfo *root,
  *
  * 'baserel' is the relation to be scanned
  * 'param_info' is the ParamPathInfo if this is a parameterized path, else NULL
+ * 'trivial_pathtarget' is true if the pathtarget is believed to be trivial.
  */
 void
 cost_subqueryscan(SubqueryScanPath *path, PlannerInfo *root,
-				  RelOptInfo *baserel, ParamPathInfo *param_info)
+				  RelOptInfo *baserel, ParamPathInfo *param_info,
+				  bool trivial_pathtarget)
 {
 	Cost		startup_cost;
 	Cost		run_cost;
+	List	   *qpquals;
 	QualCost	qpqual_cost;
 	Cost		cpu_per_tuple;
 
@@ -1401,11 +1434,24 @@ cost_subqueryscan(SubqueryScanPath *path, PlannerInfo *root,
 	Assert(baserel->relid > 0);
 	Assert(baserel->rtekind == RTE_SUBQUERY);
 
-	/* Mark the path with the correct row estimate */
+	/*
+	 * We compute the rowcount estimate as the subplan's estimate times the
+	 * selectivity of relevant restriction clauses.  In simple cases this will
+	 * come out the same as baserel->rows; but when dealing with parallelized
+	 * paths we must do it like this to get the right answer.
+	 */
 	if (param_info)
-		path->path.rows = param_info->ppi_rows;
+		qpquals = list_concat_copy(param_info->ppi_clauses,
+								   baserel->baserestrictinfo);
 	else
-		path->path.rows = baserel->rows;
+		qpquals = baserel->baserestrictinfo;
+
+	path->path.rows = clamp_row_est(path->subpath->rows *
+									clauselist_selectivity(root,
+														   qpquals,
+														   0,
+														   JOIN_INNER,
+														   NULL));
 
 	/*
 	 * Cost of path is cost of evaluating the subplan, plus cost of evaluating
@@ -1416,11 +1462,27 @@ cost_subqueryscan(SubqueryScanPath *path, PlannerInfo *root,
 	path->path.startup_cost = path->subpath->startup_cost;
 	path->path.total_cost = path->subpath->total_cost;
 
+	/*
+	 * However, if there are no relevant restriction clauses and the
+	 * pathtarget is trivial, then we expect that setrefs.c will optimize away
+	 * the SubqueryScan plan node altogether, so we should just make its cost
+	 * and rowcount equal to the input path's.
+	 *
+	 * Note: there are some edge cases where createplan.c will apply a
+	 * different targetlist to the SubqueryScan node, thus falsifying our
+	 * current estimate of whether the target is trivial, and making the cost
+	 * estimate (though not the rowcount) wrong.  It does not seem worth the
+	 * extra complication to try to account for that exactly, especially since
+	 * that behavior falsifies other cost estimates as well.
+	 */
+	if (qpquals == NIL && trivial_pathtarget)
+		return;
+
 	get_restriction_qual_cost(root, baserel, param_info, &qpqual_cost);
 
 	startup_cost = qpqual_cost.startup;
 	cpu_per_tuple = cpu_tuple_cost + qpqual_cost.per_tuple;
-	run_cost = cpu_per_tuple * baserel->tuples;
+	run_cost = cpu_per_tuple * path->subpath->rows;
 
 	/* tlist eval costs are paid per output row, not per tuple scanned */
 	startup_cost += path->path.pathtarget->cost.startup;
@@ -1899,8 +1961,8 @@ cost_incremental_sort(Path *path,
 					  double input_tuples, int width, Cost comparison_cost, int sort_mem,
 					  double limit_tuples)
 {
-	Cost		startup_cost = 0,
-				run_cost = 0,
+	Cost		startup_cost,
+				run_cost,
 				input_run_cost = input_total_cost - input_startup_cost;
 	double		group_tuples,
 				input_groups;
@@ -1909,10 +1971,9 @@ cost_incremental_sort(Path *path,
 				group_input_run_cost;
 	List	   *presortedExprs = NIL;
 	ListCell   *l;
-	int			i = 0;
 	bool		unknown_varno = false;
 
-	Assert(presorted_keys != 0);
+	Assert(presorted_keys > 0 && presorted_keys < list_length(pathkeys));
 
 	/*
 	 * We want to be sure the cost of a sort is never estimated as zero, even
@@ -1950,7 +2011,7 @@ cost_incremental_sort(Path *path,
 	{
 		PathKey    *key = (PathKey *) lfirst(l);
 		EquivalenceMember *member = (EquivalenceMember *)
-		linitial(key->pk_eclass->ec_members);
+			linitial(key->pk_eclass->ec_members);
 
 		/*
 		 * Check if the expression contains Var with "varno 0" so that we
@@ -1965,12 +2026,11 @@ cost_incremental_sort(Path *path,
 		/* expression not containing any Vars with "varno 0" */
 		presortedExprs = lappend(presortedExprs, member->em_expr);
 
-		i++;
-		if (i >= presorted_keys)
+		if (foreach_current_index(l) + 1 >= presorted_keys)
 			break;
 	}
 
-	/* Estimate number of groups with equal presorted keys. */
+	/* Estimate the number of groups with equal presorted keys. */
 	if (!unknown_varno)
 		input_groups = estimate_num_groups(root, presortedExprs, input_tuples,
 										   NULL, NULL);
@@ -1979,22 +2039,19 @@ cost_incremental_sort(Path *path,
 	group_input_run_cost = input_run_cost / input_groups;
 
 	/*
-	 * Estimate average cost of sorting of one group where presorted keys are
-	 * equal.  Incremental sort is sensitive to distribution of tuples to the
-	 * groups, where we're relying on quite rough assumptions.  Thus, we're
-	 * pessimistic about incremental sort performance and increase its average
-	 * group size by half.
+	 * Estimate the average cost of sorting of one group where presorted keys
+	 * are equal.
 	 */
 	cost_tuplesort(&group_startup_cost, &group_run_cost,
-				   1.5 * group_tuples, width, comparison_cost, sort_mem,
+				   group_tuples, width, comparison_cost, sort_mem,
 				   limit_tuples);
 
 	/*
 	 * Startup cost of incremental sort is the startup cost of its first group
 	 * plus the cost of its input.
 	 */
-	startup_cost += group_startup_cost
-		+ input_startup_cost + group_input_run_cost;
+	startup_cost = group_startup_cost + input_startup_cost +
+		group_input_run_cost;
 
 	/*
 	 * After we started producing tuples from the first group, the cost of
@@ -2002,17 +2059,20 @@ cost_incremental_sort(Path *path,
 	 * group, plus the total cost to process the remaining groups, plus the
 	 * remaining cost of input.
 	 */
-	run_cost += group_run_cost
-		+ (group_run_cost + group_startup_cost) * (input_groups - 1)
-		+ group_input_run_cost * (input_groups - 1);
+	run_cost = group_run_cost + (group_run_cost + group_startup_cost) *
+		(input_groups - 1) + group_input_run_cost * (input_groups - 1);
 
 	/*
 	 * Incremental sort adds some overhead by itself. Firstly, it has to
 	 * detect the sort groups. This is roughly equal to one extra copy and
-	 * comparison per tuple. Secondly, it has to reset the tuplesort context
-	 * for every group.
+	 * comparison per tuple.
 	 */
 	run_cost += (cpu_tuple_cost + comparison_cost) * input_tuples;
+
+	/*
+	 * Additionally, we charge double cpu_tuple_cost for each input group to
+	 * account for the tuplesort_reset that's performed after each group.
+	 */
 	run_cost += 2.0 * cpu_tuple_cost * input_groups;
 
 	path->rows = input_tuples;
@@ -2070,7 +2130,6 @@ append_nonpartial_cost(List *subpaths, int numpaths, int parallel_workers)
 	int			arrlen;
 	ListCell   *l;
 	ListCell   *cell;
-	int			i;
 	int			path_index;
 	int			min_index;
 	int			max_index;
@@ -2109,7 +2168,6 @@ append_nonpartial_cost(List *subpaths, int numpaths, int parallel_workers)
 	for_each_cell(l, subpaths, cell)
 	{
 		Path	   *subpath = (Path *) lfirst(l);
-		int			i;
 
 		/* Consider only the non-partial paths */
 		if (path_index++ == numpaths)
@@ -2118,7 +2176,8 @@ append_nonpartial_cost(List *subpaths, int numpaths, int parallel_workers)
 		costarr[min_index] += subpath->total_cost;
 
 		/* Update the new min cost array index */
-		for (min_index = i = 0; i < arrlen; i++)
+		min_index = 0;
+		for (int i = 0; i < arrlen; i++)
 		{
 			if (costarr[i] < costarr[min_index])
 				min_index = i;
@@ -2126,7 +2185,8 @@ append_nonpartial_cost(List *subpaths, int numpaths, int parallel_workers)
 	}
 
 	/* Return the highest cost from the array */
-	for (max_index = i = 0; i < arrlen; i++)
+	max_index = 0;
+	for (int i = 0; i < arrlen; i++)
 	{
 		if (costarr[i] > costarr[max_index])
 			max_index = i;
@@ -2157,13 +2217,13 @@ cost_append(AppendPath *apath)
 
 		if (pathkeys == NIL)
 		{
-			Path	   *subpath = (Path *) linitial(apath->subpaths);
+			Path	   *firstsubpath = (Path *) linitial(apath->subpaths);
 
 			/*
 			 * For an unordered, non-parallel-aware Append we take the startup
 			 * cost as the startup cost of the first subpath.
 			 */
-			apath->path.startup_cost = subpath->startup_cost;
+			apath->path.startup_cost = firstsubpath->startup_cost;
 
 			/* Compute rows and costs as sums of subplan rows and costs. */
 			foreach(l, apath->subpaths)
@@ -2405,8 +2465,8 @@ cost_material(Path *path,
 }
 
 /*
- * cost_resultcache_rescan
- *	  Determines the estimated cost of rescanning a ResultCache node.
+ * cost_memoize_rescan
+ *	  Determines the estimated cost of rescanning a Memoize node.
  *
  * In order to estimate this, we must gain knowledge of how often we expect to
  * be called and how many distinct sets of parameters we are likely to be
@@ -2418,15 +2478,16 @@ cost_material(Path *path,
  * hit and caching would be a complete waste of effort.
  */
 static void
-cost_resultcache_rescan(PlannerInfo *root, ResultCachePath *rcpath,
-						Cost *rescan_startup_cost, Cost *rescan_total_cost)
+cost_memoize_rescan(PlannerInfo *root, MemoizePath *mpath,
+					Cost *rescan_startup_cost, Cost *rescan_total_cost)
 {
 	EstimationInfo estinfo;
-	Cost		input_startup_cost = rcpath->subpath->startup_cost;
-	Cost		input_total_cost = rcpath->subpath->total_cost;
-	double		tuples = rcpath->subpath->rows;
-	double		calls = rcpath->calls;
-	int			width = rcpath->subpath->pathtarget->width;
+	ListCell   *lc;
+	Cost		input_startup_cost = mpath->subpath->startup_cost;
+	Cost		input_total_cost = mpath->subpath->total_cost;
+	double		tuples = mpath->subpath->rows;
+	double		calls = mpath->calls;
+	int			width = mpath->subpath->pathtarget->width;
 
 	double		hash_mem_bytes;
 	double		est_entry_bytes;
@@ -2438,33 +2499,35 @@ cost_resultcache_rescan(PlannerInfo *root, ResultCachePath *rcpath,
 	Cost		total_cost;
 
 	/* available cache space */
-	hash_mem_bytes = get_hash_mem() * 1024L;
+	hash_mem_bytes = get_hash_memory_limit();
 
 	/*
 	 * Set the number of bytes each cache entry should consume in the cache.
 	 * To provide us with better estimations on how many cache entries we can
 	 * store at once, we make a call to the executor here to ask it what
 	 * memory overheads there are for a single cache entry.
-	 *
-	 * XXX we also store the cache key, but that's not accounted for here.
 	 */
 	est_entry_bytes = relation_byte_size(tuples, width) +
 		ExecEstimateCacheEntryOverheadBytes(tuples);
+
+	/* include the estimated width for the cache keys */
+	foreach(lc, mpath->param_exprs)
+		est_entry_bytes += get_expr_width(root, (Node *) lfirst(lc));
 
 	/* estimate on the upper limit of cache entries we can hold at once */
 	est_cache_entries = floor(hash_mem_bytes / est_entry_bytes);
 
 	/* estimate on the distinct number of parameter values */
-	ndistinct = estimate_num_groups(root, rcpath->param_exprs, calls, NULL,
+	ndistinct = estimate_num_groups(root, mpath->param_exprs, calls, NULL,
 									&estinfo);
 
 	/*
 	 * When the estimation fell back on using a default value, it's a bit too
-	 * risky to assume that it's ok to use a Result Cache.  The use of a
-	 * default could cause us to use a Result Cache when it's really
+	 * risky to assume that it's ok to use a Memoize node.  The use of a
+	 * default could cause us to use a Memoize node when it's really
 	 * inappropriate to do so.  If we see that this has been done, then we'll
 	 * assume that every call will have unique parameters, which will almost
-	 * certainly mean a ResultCachePath will never survive add_path().
+	 * certainly mean a MemoizePath will never survive add_path().
 	 */
 	if ((estinfo.flags & SELFLAG_USED_DEFAULT) != 0)
 		ndistinct = calls;
@@ -2478,8 +2541,8 @@ cost_resultcache_rescan(PlannerInfo *root, ResultCachePath *rcpath,
 	 * size itself.  Really this is not the right place to do this, but it's
 	 * convenient since everything is already calculated.
 	 */
-	rcpath->est_entries = Min(Min(ndistinct, est_cache_entries),
-							  PG_UINT32_MAX);
+	mpath->est_entries = Min(Min(ndistinct, est_cache_entries),
+							 PG_UINT32_MAX);
 
 	/*
 	 * When the number of distinct parameter values is above the amount we can
@@ -2495,11 +2558,10 @@ cost_resultcache_rescan(PlannerInfo *root, ResultCachePath *rcpath,
 	 * must look at how many scans are estimated in total for this node and
 	 * how many of those scans we expect to get a cache hit.
 	 */
-	hit_ratio = 1.0 / ndistinct * Min(est_cache_entries, ndistinct) -
-		(ndistinct / calls);
+	hit_ratio = ((calls - ndistinct) / calls) *
+		(est_cache_entries / Max(ndistinct, est_cache_entries));
 
-	/* Ensure we don't go negative */
-	hit_ratio = Max(hit_ratio, 0.0);
+	Assert(hit_ratio >= 0 && hit_ratio <= 1.0);
 
 	/*
 	 * Set the total_cost accounting for the expected cache hit ratio.  We
@@ -2748,6 +2810,226 @@ cost_agg(Path *path, PlannerInfo *root,
 }
 
 /*
+ * get_windowclause_startup_tuples
+ *		Estimate how many tuples we'll need to fetch from a WindowAgg's
+ *		subnode before we can output the first WindowAgg tuple.
+ *
+ * How many tuples need to be read depends on the WindowClause.  For example,
+ * a WindowClause with no PARTITION BY and no ORDER BY requires that all
+ * subnode tuples are read and aggregated before the WindowAgg can output
+ * anything.  If there's a PARTITION BY, then we only need to look at tuples
+ * in the first partition.  Here we attempt to estimate just how many
+ * 'input_tuples' the WindowAgg will need to read for the given WindowClause
+ * before the first tuple can be output.
+ */
+static double
+get_windowclause_startup_tuples(PlannerInfo *root, WindowClause *wc,
+								double input_tuples)
+{
+	int			frameOptions = wc->frameOptions;
+	double		partition_tuples;
+	double		return_tuples;
+	double		peer_tuples;
+
+	/*
+	 * First, figure out how many partitions there are likely to be and set
+	 * partition_tuples according to that estimate.
+	 */
+	if (wc->partitionClause != NIL)
+	{
+		double		num_partitions;
+		List	   *partexprs = get_sortgrouplist_exprs(wc->partitionClause,
+														root->parse->targetList);
+
+		num_partitions = estimate_num_groups(root, partexprs, input_tuples,
+											 NULL, NULL);
+		list_free(partexprs);
+
+		partition_tuples = input_tuples / num_partitions;
+	}
+	else
+	{
+		/* all tuples belong to the same partition */
+		partition_tuples = input_tuples;
+	}
+
+	/* estimate the number of tuples in each peer group */
+	if (wc->orderClause != NIL)
+	{
+		double		num_groups;
+		List	   *orderexprs;
+
+		orderexprs = get_sortgrouplist_exprs(wc->orderClause,
+											 root->parse->targetList);
+
+		/* estimate out how many peer groups there are in the partition */
+		num_groups = estimate_num_groups(root, orderexprs,
+										 partition_tuples, NULL,
+										 NULL);
+		list_free(orderexprs);
+		peer_tuples = partition_tuples / num_groups;
+	}
+	else
+	{
+		/* no ORDER BY so only 1 tuple belongs in each peer group */
+		peer_tuples = 1.0;
+	}
+
+	if (frameOptions & FRAMEOPTION_END_UNBOUNDED_FOLLOWING)
+	{
+		/* include all partition rows */
+		return_tuples = partition_tuples;
+	}
+	else if (frameOptions & FRAMEOPTION_END_CURRENT_ROW)
+	{
+		if (frameOptions & FRAMEOPTION_ROWS)
+		{
+			/* just count the current row */
+			return_tuples = 1.0;
+		}
+		else if (frameOptions & (FRAMEOPTION_RANGE | FRAMEOPTION_GROUPS))
+		{
+			/*
+			 * When in RANGE/GROUPS mode, it's more complex.  If there's no
+			 * ORDER BY, then all rows in the partition are peers, otherwise
+			 * we'll need to read the first group of peers.
+			 */
+			if (wc->orderClause == NIL)
+				return_tuples = partition_tuples;
+			else
+				return_tuples = peer_tuples;
+		}
+		else
+		{
+			/*
+			 * Something new we don't support yet?  This needs attention.
+			 * We'll just return 1.0 in the meantime.
+			 */
+			Assert(false);
+			return_tuples = 1.0;
+		}
+	}
+	else if (frameOptions & FRAMEOPTION_END_OFFSET_PRECEDING)
+	{
+		/*
+		 * BETWEEN ... AND N PRECEDING will only need to read the WindowAgg's
+		 * subnode after N ROWS/RANGES/GROUPS.  N can be 0, but not negative,
+		 * so we'll just assume only the current row needs to be read to fetch
+		 * the first WindowAgg row.
+		 */
+		return_tuples = 1.0;
+	}
+	else if (frameOptions & FRAMEOPTION_END_OFFSET_FOLLOWING)
+	{
+		Const	   *endOffset = (Const *) wc->endOffset;
+		double		end_offset_value;
+
+		/* try and figure out the value specified in the endOffset. */
+		if (IsA(endOffset, Const))
+		{
+			if (endOffset->constisnull)
+			{
+				/*
+				 * NULLs are not allowed, but currently, there's no code to
+				 * error out if there's a NULL Const.  We'll only discover
+				 * this during execution.  For now, just pretend everything is
+				 * fine and assume that just the first row/range/group will be
+				 * needed.
+				 */
+				end_offset_value = 1.0;
+			}
+			else
+			{
+				switch (endOffset->consttype)
+				{
+					case INT2OID:
+						end_offset_value =
+							(double) DatumGetInt16(endOffset->constvalue);
+						break;
+					case INT4OID:
+						end_offset_value =
+							(double) DatumGetInt32(endOffset->constvalue);
+						break;
+					case INT8OID:
+						end_offset_value =
+							(double) DatumGetInt64(endOffset->constvalue);
+						break;
+					default:
+						end_offset_value =
+							partition_tuples / peer_tuples *
+							DEFAULT_INEQ_SEL;
+						break;
+				}
+			}
+		}
+		else
+		{
+			/*
+			 * When the end bound is not a Const, we'll just need to guess. We
+			 * just make use of DEFAULT_INEQ_SEL.
+			 */
+			end_offset_value =
+				partition_tuples / peer_tuples * DEFAULT_INEQ_SEL;
+		}
+
+		if (frameOptions & FRAMEOPTION_ROWS)
+		{
+			/* include the N FOLLOWING and the current row */
+			return_tuples = end_offset_value + 1.0;
+		}
+		else if (frameOptions & (FRAMEOPTION_RANGE | FRAMEOPTION_GROUPS))
+		{
+			/* include N FOLLOWING ranges/group and the initial range/group */
+			return_tuples = peer_tuples * (end_offset_value + 1.0);
+		}
+		else
+		{
+			/*
+			 * Something new we don't support yet?  This needs attention.
+			 * We'll just return 1.0 in the meantime.
+			 */
+			Assert(false);
+			return_tuples = 1.0;
+		}
+	}
+	else
+	{
+		/*
+		 * Something new we don't support yet?  This needs attention.  We'll
+		 * just return 1.0 in the meantime.
+		 */
+		Assert(false);
+		return_tuples = 1.0;
+	}
+
+	if (wc->partitionClause != NIL || wc->orderClause != NIL)
+	{
+		/*
+		 * Cap the return value to the estimated partition tuples and account
+		 * for the extra tuple WindowAgg will need to read to confirm the next
+		 * tuple does not belong to the same partition or peer group.
+		 */
+		return_tuples = Min(return_tuples + 1.0, partition_tuples);
+	}
+	else
+	{
+		/*
+		 * Cap the return value so it's never higher than the expected tuples
+		 * in the partition.
+		 */
+		return_tuples = Min(return_tuples, partition_tuples);
+	}
+
+	/*
+	 * We needn't worry about any EXCLUDE options as those only exclude rows
+	 * from being aggregated, not from being read from the WindowAgg's
+	 * subnode.
+	 */
+
+	return clamp_row_est(return_tuples);
+}
+
+/*
  * cost_windowagg
  *		Determines and returns the cost of performing a WindowAgg plan node,
  *		including the cost of its input.
@@ -2756,13 +3038,19 @@ cost_agg(Path *path, PlannerInfo *root,
  */
 void
 cost_windowagg(Path *path, PlannerInfo *root,
-			   List *windowFuncs, int numPartCols, int numOrderCols,
+			   List *windowFuncs, WindowClause *winclause,
 			   Cost input_startup_cost, Cost input_total_cost,
 			   double input_tuples)
 {
 	Cost		startup_cost;
 	Cost		total_cost;
+	double		startup_tuples;
+	int			numPartCols;
+	int			numOrderCols;
 	ListCell   *lc;
+
+	numPartCols = list_length(winclause->partitionClause);
+	numOrderCols = list_length(winclause->orderClause);
 
 	startup_cost = input_startup_cost;
 	total_cost = input_total_cost;
@@ -2818,6 +3106,21 @@ cost_windowagg(Path *path, PlannerInfo *root,
 	path->rows = input_tuples;
 	path->startup_cost = startup_cost;
 	path->total_cost = total_cost;
+
+	/*
+	 * Also, take into account how many tuples we need to read from the
+	 * subnode in order to produce the first tuple from the WindowAgg.  To do
+	 * this we proportion the run cost (total cost not including startup cost)
+	 * over the estimated startup tuples.  We already included the startup
+	 * cost of the subnode, so we only need to do this when the estimated
+	 * startup tuples is above 1.0.
+	 */
+	startup_tuples = get_windowclause_startup_tuples(root, winclause,
+													 input_tuples);
+
+	if (startup_tuples > 1.0)
+		path->startup_cost += (total_cost - startup_cost) / input_tuples *
+			(startup_tuples - 1.0);
 }
 
 /*
@@ -2978,8 +3281,8 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
 					JoinCostWorkspace *workspace,
 					JoinPathExtraData *extra)
 {
-	Path	   *outer_path = path->outerjoinpath;
-	Path	   *inner_path = path->innerjoinpath;
+	Path	   *outer_path = path->jpath.outerjoinpath;
+	Path	   *inner_path = path->jpath.innerjoinpath;
 	double		outer_path_rows = outer_path->rows;
 	double		inner_path_rows = inner_path->rows;
 	Cost		startup_cost = workspace->startup_cost;
@@ -2994,18 +3297,18 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
 	if (inner_path_rows <= 0)
 		inner_path_rows = 1;
 	/* Mark the path with the correct row estimate */
-	if (path->path.param_info)
-		path->path.rows = path->path.param_info->ppi_rows;
+	if (path->jpath.path.param_info)
+		path->jpath.path.rows = path->jpath.path.param_info->ppi_rows;
 	else
-		path->path.rows = path->path.parent->rows;
+		path->jpath.path.rows = path->jpath.path.parent->rows;
 
 	/* For partial paths, scale row estimate. */
-	if (path->path.parallel_workers > 0)
+	if (path->jpath.path.parallel_workers > 0)
 	{
-		double		parallel_divisor = get_parallel_divisor(&path->path);
+		double		parallel_divisor = get_parallel_divisor(&path->jpath.path);
 
-		path->path.rows =
-			clamp_row_est(path->path.rows / parallel_divisor);
+		path->jpath.path.rows =
+			clamp_row_est(path->jpath.path.rows / parallel_divisor);
 	}
 
 	/*
@@ -3018,7 +3321,7 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
 
 	/* cost of inner-relation source data (we already dealt with outer rel) */
 
-	if (path->jointype == JOIN_SEMI || path->jointype == JOIN_ANTI ||
+	if (path->jpath.jointype == JOIN_SEMI || path->jpath.jointype == JOIN_ANTI ||
 		extra->inner_unique)
 	{
 		/*
@@ -3136,17 +3439,17 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
 	}
 
 	/* CPU costs */
-	cost_qual_eval(&restrict_qual_cost, path->joinrestrictinfo, root);
+	cost_qual_eval(&restrict_qual_cost, path->jpath.joinrestrictinfo, root);
 	startup_cost += restrict_qual_cost.startup;
 	cpu_per_tuple = cpu_tuple_cost + restrict_qual_cost.per_tuple;
 	run_cost += cpu_per_tuple * ntuples;
 
 	/* tlist eval costs are paid per output row, not per tuple scanned */
-	startup_cost += path->path.pathtarget->cost.startup;
-	run_cost += path->path.pathtarget->cost.per_tuple * path->path.rows;
+	startup_cost += path->jpath.path.pathtarget->cost.startup;
+	run_cost += path->jpath.path.pathtarget->cost.per_tuple * path->jpath.path.rows;
 
-	path->path.startup_cost = startup_cost;
-	path->path.total_cost = startup_cost + run_cost;
+	path->jpath.path.startup_cost = startup_cost;
+	path->jpath.path.total_cost = startup_cost + run_cost;
 }
 
 /*
@@ -3268,7 +3571,8 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 			outerstartsel = 0.0;
 			outerendsel = 1.0;
 		}
-		else if (jointype == JOIN_RIGHT)
+		else if (jointype == JOIN_RIGHT ||
+				 jointype == JOIN_RIGHT_ANTI)
 		{
 			innerstartsel = 0.0;
 			innerendsel = 1.0;
@@ -3860,7 +4164,6 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path,
 	Cost		run_cost = workspace->run_cost;
 	int			numbuckets = workspace->numbuckets;
 	int			numbatches = workspace->numbatches;
-	int			hash_mem;
 	Cost		cpu_per_tuple;
 	QualCost	hash_qual_cost;
 	QualCost	qp_qual_cost;
@@ -3986,10 +4289,8 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path,
 	 * that way, so it will be unable to drive the batch size below hash_mem
 	 * when this is true.)
 	 */
-	hash_mem = get_hash_mem();
 	if (relation_byte_size(clamp_row_est(inner_path_rows * innermcvfreq),
-						   inner_path->pathtarget->width) >
-		(hash_mem * 1024L))
+						   inner_path->pathtarget->width) > get_hash_memory_limit())
 		startup_cost += disable_cost;
 
 	/*
@@ -4285,10 +4586,10 @@ cost_rescan(PlannerInfo *root, Path *path,
 				*rescan_total_cost = run_cost;
 			}
 			break;
-		case T_ResultCache:
-			/* All the hard work is done by cost_resultcache_rescan */
-			cost_resultcache_rescan(root, (ResultCachePath *) path,
-									rescan_startup_cost, rescan_total_cost);
+		case T_Memoize:
+			/* All the hard work is done by cost_memoize_rescan */
+			cost_memoize_rescan(root, (MemoizePath *) path,
+								rescan_startup_cost, rescan_total_cost);
 			break;
 		default:
 			*rescan_startup_cost = path->startup_cost;
@@ -4493,6 +4794,12 @@ cost_qual_eval_walker(Node *node, cost_qual_eval_context *context)
 		 * be factored into plan-node-specific costing of the Agg or WindowAgg
 		 * plan node.
 		 */
+		return false;			/* don't recurse into children */
+	}
+	else if (IsA(node, GroupingFunc))
+	{
+		/* Treat this as having cost 1 */
+		context->total.per_tuple += cpu_operator_cost;
 		return false;			/* don't recurse into children */
 	}
 	else if (IsA(node, CoerceViaIO))
@@ -4720,9 +5027,13 @@ compute_semi_anti_join_factors(PlannerInfo *root,
 	norm_sjinfo.syn_lefthand = outerrel->relids;
 	norm_sjinfo.syn_righthand = innerrel->relids;
 	norm_sjinfo.jointype = JOIN_INNER;
+	norm_sjinfo.ojrelid = 0;
+	norm_sjinfo.commute_above_l = NULL;
+	norm_sjinfo.commute_above_r = NULL;
+	norm_sjinfo.commute_below_l = NULL;
+	norm_sjinfo.commute_below_r = NULL;
 	/* we don't bother trying to make the remaining fields valid */
 	norm_sjinfo.lhs_strict = false;
-	norm_sjinfo.delay_upper_joins = false;
 	norm_sjinfo.semi_can_btree = false;
 	norm_sjinfo.semi_can_hash = false;
 	norm_sjinfo.semi_operators = NIL;
@@ -4774,8 +5085,9 @@ compute_semi_anti_join_factors(PlannerInfo *root,
  * expensive.
  */
 static bool
-has_indexed_join_quals(NestPath *joinpath)
+has_indexed_join_quals(NestPath *path)
 {
+	JoinPath   *joinpath = &path->jpath;
 	Relids		joinrelids = joinpath->path.parent->relids;
 	Path	   *innerpath = joinpath->innerjoinpath;
 	List	   *indexclauses;
@@ -4884,9 +5196,13 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
 	sjinfo.syn_lefthand = path->outerjoinpath->parent->relids;
 	sjinfo.syn_righthand = path->innerjoinpath->parent->relids;
 	sjinfo.jointype = JOIN_INNER;
+	sjinfo.ojrelid = 0;
+	sjinfo.commute_above_l = NULL;
+	sjinfo.commute_above_r = NULL;
+	sjinfo.commute_below_l = NULL;
+	sjinfo.commute_below_r = NULL;
 	/* we don't bother trying to make the remaining fields valid */
 	sjinfo.lhs_strict = false;
-	sjinfo.delay_upper_joins = false;
 	sjinfo.semi_can_btree = false;
 	sjinfo.semi_can_hash = false;
 	sjinfo.semi_operators = NIL;
@@ -5081,10 +5397,8 @@ calc_joinrel_size_estimate(PlannerInfo *root,
 						   double outer_rows,
 						   double inner_rows,
 						   SpecialJoinInfo *sjinfo,
-						   List *restrictlist_in)
+						   List *restrictlist)
 {
-	/* This apparently-useless variable dodges a compiler bug in VS2013: */
-	List	   *restrictlist = restrictlist_in;
 	JoinType	jointype = sjinfo->jointype;
 	Selectivity fkselec;
 	Selectivity jselec;
@@ -5661,10 +5975,11 @@ set_cte_size_estimates(PlannerInfo *root, RelOptInfo *rel, double cte_rows)
 	if (rte->self_reference)
 	{
 		/*
-		 * In a self-reference, arbitrarily assume the average worktable size
-		 * is about 10 times the nonrecursive term's size.
+		 * In a self-reference, we assume the average worktable size is a
+		 * multiple of the nonrecursive term's size.  The best multiplier will
+		 * vary depending on query "fan-out", so make its value adjustable.
 		 */
-		rel->tuples = 10 * cte_rows;
+		rel->tuples = clamp_row_est(recursive_worktable_factor * cte_rows);
 	}
 	else
 	{
@@ -5864,7 +6179,7 @@ set_rel_width(PlannerInfo *root, RelOptInfo *rel)
 			 * scanning this rel, so be sure to include it in reltarget->cost.
 			 */
 			PlaceHolderVar *phv = (PlaceHolderVar *) node;
-			PlaceHolderInfo *phinfo = find_placeholder_info(root, phv, false);
+			PlaceHolderInfo *phinfo = find_placeholder_info(root, phv);
 			QualCost	cost;
 
 			tuple_width += phinfo->ph_width;
@@ -5954,53 +6269,13 @@ set_pathtarget_cost_width(PlannerInfo *root, PathTarget *target)
 	{
 		Node	   *node = (Node *) lfirst(lc);
 
-		if (IsA(node, Var))
+		tuple_width += get_expr_width(root, node);
+
+		/* For non-Vars, account for evaluation cost */
+		if (!IsA(node, Var))
 		{
-			Var		   *var = (Var *) node;
-			int32		item_width;
-
-			/* We should not see any upper-level Vars here */
-			Assert(var->varlevelsup == 0);
-
-			/* Try to get data from RelOptInfo cache */
-			if (var->varno < root->simple_rel_array_size)
-			{
-				RelOptInfo *rel = root->simple_rel_array[var->varno];
-
-				if (rel != NULL &&
-					var->varattno >= rel->min_attr &&
-					var->varattno <= rel->max_attr)
-				{
-					int			ndx = var->varattno - rel->min_attr;
-
-					if (rel->attr_widths[ndx] > 0)
-					{
-						tuple_width += rel->attr_widths[ndx];
-						continue;
-					}
-				}
-			}
-
-			/*
-			 * No cached data available, so estimate using just the type info.
-			 */
-			item_width = get_typavgwidth(var->vartype, var->vartypmod);
-			Assert(item_width > 0);
-			tuple_width += item_width;
-		}
-		else
-		{
-			/*
-			 * Handle general expressions using type info.
-			 */
-			int32		item_width;
 			QualCost	cost;
 
-			item_width = get_typavgwidth(exprType(node), exprTypmod(node));
-			Assert(item_width > 0);
-			tuple_width += item_width;
-
-			/* Account for cost, too */
 			cost_qual_eval_node(&cost, node, root);
 			target->cost.startup += cost.startup;
 			target->cost.per_tuple += cost.per_tuple;
@@ -6011,6 +6286,55 @@ set_pathtarget_cost_width(PlannerInfo *root, PathTarget *target)
 	target->width = tuple_width;
 
 	return target;
+}
+
+/*
+ * get_expr_width
+ *		Estimate the width of the given expr attempting to use the width
+ *		cached in a Var's owning RelOptInfo, else fallback on the type's
+ *		average width when unable to or when the given Node is not a Var.
+ */
+static int32
+get_expr_width(PlannerInfo *root, const Node *expr)
+{
+	int32		width;
+
+	if (IsA(expr, Var))
+	{
+		const Var  *var = (const Var *) expr;
+
+		/* We should not see any upper-level Vars here */
+		Assert(var->varlevelsup == 0);
+
+		/* Try to get data from RelOptInfo cache */
+		if (!IS_SPECIAL_VARNO(var->varno) &&
+			var->varno < root->simple_rel_array_size)
+		{
+			RelOptInfo *rel = root->simple_rel_array[var->varno];
+
+			if (rel != NULL &&
+				var->varattno >= rel->min_attr &&
+				var->varattno <= rel->max_attr)
+			{
+				int			ndx = var->varattno - rel->min_attr;
+
+				if (rel->attr_widths[ndx] > 0)
+					return rel->attr_widths[ndx];
+			}
+		}
+
+		/*
+		 * No cached data available, so estimate using just the type info.
+		 */
+		width = get_typavgwidth(var->vartype, var->vartypmod);
+		Assert(width > 0);
+
+		return width;
+	}
+
+	width = get_typavgwidth(exprType(expr), exprTypmod(expr));
+	Assert(width > 0);
+	return width;
 }
 
 /*
@@ -6151,7 +6475,7 @@ compute_bitmap_pages(PlannerInfo *root, RelOptInfo *baserel, Path *bitmapqual,
 		exact_pages = heap_pages - lossy_pages;
 
 		/*
-		 * If there are lossy pages then recompute the  number of tuples
+		 * If there are lossy pages then recompute the number of tuples
 		 * processed by the bitmap heap node.  We assume here that the chance
 		 * of a given tuple coming from an exact page is the same as the
 		 * chance that a given page is exact.  This might not be true, but

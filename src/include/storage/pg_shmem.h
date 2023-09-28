@@ -14,7 +14,7 @@
  * only one ID number.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/pg_shmem.h
@@ -42,16 +42,17 @@ typedef struct PGShmemHeader	/* standard header for all Postgres shmem */
 } PGShmemHeader;
 
 /* GUC variables */
-extern int	shared_memory_type;
-extern int	huge_pages;
-extern int	huge_page_size;
+extern PGDLLIMPORT int shared_memory_type;
+extern PGDLLIMPORT int huge_pages;
+extern PGDLLIMPORT int huge_page_size;
 
-/* Possible values for huge_pages */
+/* Possible values for huge_pages and huge_pages_status */
 typedef enum
 {
 	HUGE_PAGES_OFF,
 	HUGE_PAGES_ON,
-	HUGE_PAGES_TRY
+	HUGE_PAGES_TRY,				/* only for huge_pages */
+	HUGE_PAGES_UNKNOWN			/* only for huge_pages_status */
 }			HugePagesType;
 
 /* Possible values for shared_memory_type */
@@ -63,12 +64,12 @@ typedef enum
 }			PGShmemType;
 
 #ifndef WIN32
-extern unsigned long UsedShmemSegID;
+extern PGDLLIMPORT unsigned long UsedShmemSegID;
 #else
-extern HANDLE UsedShmemSegID;
-extern void *ShmemProtectiveRegion;
+extern PGDLLIMPORT HANDLE UsedShmemSegID;
+extern PGDLLIMPORT void *ShmemProtectiveRegion;
 #endif
-extern void *UsedShmemSegAddr;
+extern PGDLLIMPORT void *UsedShmemSegAddr;
 
 #if !defined(WIN32) && !defined(EXEC_BACKEND)
 #define DEFAULT_SHARED_MEMORY_TYPE SHMEM_TYPE_MMAP
@@ -87,5 +88,6 @@ extern PGShmemHeader *PGSharedMemoryCreate(Size size,
 										   PGShmemHeader **shim);
 extern bool PGSharedMemoryIsInUse(unsigned long id1, unsigned long id2);
 extern void PGSharedMemoryDetach(void);
+extern void GetHugePageSize(Size *hugepagesize, int *mmap_flags);
 
 #endif							/* PG_SHMEM_H */

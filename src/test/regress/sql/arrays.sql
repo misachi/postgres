@@ -2,6 +2,9 @@
 -- ARRAYS
 --
 
+-- directory paths are passed to us in environment variables
+\getenv abs_srcdir PG_ABS_SRCDIR
+
 CREATE TABLE arrtest (
 	a 			int2[],
 	b 			int4[][][],
@@ -11,6 +14,16 @@ CREATE TABLE arrtest (
 	f			char(5)[],
 	g			varchar(5)[]
 );
+
+CREATE TABLE array_op_test (
+	seqno		int4,
+	i			int4[],
+	t			text[]
+);
+
+\set filename :abs_srcdir '/data/array.data'
+COPY array_op_test FROM :'filename';
+ANALYZE array_op_test;
 
 --
 -- only the 'e' array is 0-based, the others are 1-based.
@@ -100,6 +113,12 @@ SELECT a FROM arrtest WHERE a[2] IS NULL;
 DELETE FROM arrtest WHERE a[2] IS NULL AND b IS NULL;
 SELECT a,b,c FROM arrtest;
 
+-- test non-error-throwing API
+SELECT pg_input_is_valid('{1,2,3}', 'integer[]');
+SELECT pg_input_is_valid('{1,2', 'integer[]');
+SELECT pg_input_is_valid('{1,zed}', 'integer[]');
+SELECT * FROM pg_input_error_info('{1,zed}', 'integer[]');
+
 -- test mixed slice/scalar subscripting
 select '{{1,2,3},{4,5,6},{7,8,9}}'::int[];
 select ('{{1,2,3},{4,5,6},{7,8,9}}'::int[])[1:2][2];
@@ -152,6 +171,10 @@ SELECT * FROM arrtest_s;
 UPDATE arrtest_s SET a[:] = '{23, 24, 25}';  -- fail, too small
 INSERT INTO arrtest_s VALUES(NULL, NULL);
 UPDATE arrtest_s SET a[:] = '{11, 12, 13, 14, 15}';  -- fail, no good with null
+
+-- we want to work with a point_tbl that includes a null
+CREATE TEMP TABLE point_tbl AS SELECT * FROM public.point_tbl;
+INSERT INTO POINT_TBL(f1) VALUES (NULL);
 
 -- check with fixed-length-array type, such as point
 SELECT f1[0:1] FROM POINT_TBL;
@@ -317,6 +340,8 @@ SELECT ARRAY[[1,2],[3,4]] || ARRAY[5,6] AS "{{1,2},{3,4},{5,6}}";
 SELECT ARRAY[0,0] || ARRAY[1,1] || ARRAY[2,2] AS "{0,0,1,1,2,2}";
 SELECT 0 || ARRAY[1,2] || 3 AS "{0,1,2,3}";
 SELECT ARRAY[1.1] || ARRAY[2,3,4];
+SELECT array_agg(x) || array_agg(x) FROM (VALUES (ROW(1,2)), (ROW(3,4))) v(x);
+SELECT ROW(1,2) || array_agg(x) FROM (VALUES (ROW(3,4)), (ROW(5,6))) v(x);
 
 SELECT * FROM array_op_test WHERE i @> '{32}' ORDER BY seqno;
 SELECT * FROM array_op_test WHERE i && '{32}' ORDER BY seqno;
@@ -652,12 +677,12 @@ insert into src
 create type textandtext as (c1 text, c2 text);
 create temp table dest (f1 textandtext[]);
 insert into dest select array[row(f1,f1)::textandtext] from src;
-select length(md5((f1[1]).c2)) from dest;
+select length(fipshash((f1[1]).c2)) from dest;
 delete from src;
-select length(md5((f1[1]).c2)) from dest;
+select length(fipshash((f1[1]).c2)) from dest;
 truncate table src;
 drop table src;
-select length(md5((f1[1]).c2)) from dest;
+select length(fipshash((f1[1]).c2)) from dest;
 drop table dest;
 drop type textandtext;
 
@@ -735,3 +760,18 @@ FROM
 
 SELECT trim_array(ARRAY[1, 2, 3], -1); -- fail
 SELECT trim_array(ARRAY[1, 2, 3], 10); -- fail
+SELECT trim_array(ARRAY[]::int[], 1); -- fail
+
+-- array_shuffle
+SELECT array_shuffle('{1,2,3,4,5,6}'::int[]) <@ '{1,2,3,4,5,6}';
+SELECT array_shuffle('{1,2,3,4,5,6}'::int[]) @> '{1,2,3,4,5,6}';
+SELECT array_dims(array_shuffle('[-1:2][2:3]={{1,2},{3,NULL},{5,6},{7,8}}'::int[]));
+SELECT array_dims(array_shuffle('{{{1,2},{3,NULL}},{{5,6},{7,8}},{{9,10},{11,12}}}'::int[]));
+
+-- array_sample
+SELECT array_sample('{1,2,3,4,5,6}'::int[], 3) <@ '{1,2,3,4,5,6}';
+SELECT array_length(array_sample('{1,2,3,4,5,6}'::int[], 3), 1);
+SELECT array_dims(array_sample('[-1:2][2:3]={{1,2},{3,NULL},{5,6},{7,8}}'::int[], 3));
+SELECT array_dims(array_sample('{{{1,2},{3,NULL}},{{5,6},{7,8}},{{9,10},{11,12}}}'::int[], 2));
+SELECT array_sample('{1,2,3,4,5,6}'::int[], -1); -- fail
+SELECT array_sample('{1,2,3,4,5,6}'::int[], 7); --fail

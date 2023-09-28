@@ -3,7 +3,7 @@
  * pg_type.c
  *	  routines to support manipulation of the pg_type relation
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -26,6 +26,7 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "commands/defrem.h"
 #include "commands/typecmds.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
@@ -36,9 +37,6 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
-
-static char *makeUniqueTypeName(const char *typeName, Oid typeNamespace,
-								bool tryOriginal);
 
 /* Potentially set by pg_upgrade_support functions */
 Oid			binary_upgrade_next_pg_type_oid = InvalidOid;
@@ -167,6 +165,7 @@ TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
 								 0,
 								 false,
 								 false,
+								 true,	/* make extension dependency */
 								 false);
 
 	/* Post creation hook for new shell type */
@@ -504,6 +503,7 @@ TypeCreate(Oid newTypeOid,
 								 relationKind,
 								 isImplicitArray,
 								 isDependentType,
+								 true,	/* make extension dependency */
 								 rebuildDeps);
 
 	/* Post creation hook for new type */
@@ -537,13 +537,20 @@ TypeCreate(Oid newTypeOid,
  * isDependentType is true if this is an implicit array or relation rowtype;
  * that means it doesn't need its own dependencies on owner etc.
  *
- * If rebuild is true, we remove existing dependencies and rebuild them
- * from scratch.  This is needed for ALTER TYPE, and also when replacing
- * a shell type.  We don't remove an existing extension dependency, though.
- * (That means an extension can't absorb a shell type created in another
- * extension, nor ALTER a type created by another extension.  Also, if it
- * replaces a free-standing shell type or ALTERs a free-standing type,
- * that type will become a member of the extension.)
+ * We make an extension-membership dependency if we're in an extension
+ * script and makeExtensionDep is true (and isDependentType isn't true).
+ * makeExtensionDep should be true when creating a new type or replacing a
+ * shell type, but not for ALTER TYPE on an existing type.  Passing false
+ * causes the type's extension membership to be left alone.
+ *
+ * rebuild should be true if this is a pre-existing type.  We will remove
+ * existing dependencies and rebuild them from scratch.  This is needed for
+ * ALTER TYPE, and also when replacing a shell type.  We don't remove any
+ * existing extension dependency, though; hence, if makeExtensionDep is also
+ * true and we're in an extension script, an error will occur unless the
+ * type already belongs to the current extension.  That's the behavior we
+ * want when replacing a shell type, which is the only case where both flags
+ * are true.
  */
 void
 GenerateTypeDependencies(HeapTuple typeTuple,
@@ -553,6 +560,7 @@ GenerateTypeDependencies(HeapTuple typeTuple,
 						 char relationKind, /* only for relation rowtypes */
 						 bool isImplicitArray,
 						 bool isDependentType,
+						 bool makeExtensionDep,
 						 bool rebuild)
 {
 	Form_pg_type typeForm = (Form_pg_type) GETSTRUCT(typeTuple);
@@ -611,7 +619,8 @@ GenerateTypeDependencies(HeapTuple typeTuple,
 		recordDependencyOnNewAcl(TypeRelationId, typeObjectId, 0,
 								 typeForm->typowner, typacl);
 
-		recordDependencyOnCurrentExtension(&myself, rebuild);
+		if (makeExtensionDep)
+			recordDependencyOnCurrentExtension(&myself, rebuild);
 	}
 
 	/* Normal dependencies on the I/O and support functions */
@@ -807,16 +816,41 @@ RenameTypeInternal(Oid typeOid, const char *newTypeName, Oid typeNamespace)
 char *
 makeArrayTypeName(const char *typeName, Oid typeNamespace)
 {
-	char	   *arr;
+	char	   *arr_name;
+	int			pass = 0;
+	char		suffix[NAMEDATALEN];
 
-	arr = makeUniqueTypeName(typeName, typeNamespace, false);
-	if (arr == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("could not form array type name for type \"%s\"",
-						typeName)));
+	/*
+	 * Per ancient Postgres tradition, array type names are made by prepending
+	 * an underscore to the base type name.  Much client code knows that
+	 * convention, so don't muck with it.  However, the tradition is less
+	 * clear about what to do in the corner cases where the resulting name is
+	 * too long or conflicts with an existing name.  Our current rules are (1)
+	 * truncate the base name on the right as needed, and (2) if there is a
+	 * conflict, append another underscore and some digits chosen to make it
+	 * unique.  This is similar to what ChooseRelationName() does.
+	 *
+	 * The actual name generation can be farmed out to makeObjectName() by
+	 * giving it an empty first name component.
+	 */
 
-	return arr;
+	/* First, try with no numeric suffix */
+	arr_name = makeObjectName("", typeName, NULL);
+
+	for (;;)
+	{
+		if (!SearchSysCacheExists2(TYPENAMENSP,
+								   CStringGetDatum(arr_name),
+								   ObjectIdGetDatum(typeNamespace)))
+			break;
+
+		/* That attempt conflicted.  Prepare a new name with some digits. */
+		pfree(arr_name);
+		snprintf(suffix, sizeof(suffix), "%d", ++pass);
+		arr_name = makeObjectName("", typeName, suffix);
+	}
+
+	return arr_name;
 }
 
 
@@ -919,52 +953,7 @@ makeMultirangeTypeName(const char *rangeTypeName, Oid typeNamespace)
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("type \"%s\" already exists", buf),
 				 errdetail("Failed while creating a multirange type for type \"%s\".", rangeTypeName),
-				 errhint("You can manually specify a multirange type name using the \"multirange_type_name\" attribute")));
+				 errhint("You can manually specify a multirange type name using the \"multirange_type_name\" attribute.")));
 
 	return pstrdup(buf);
-}
-
-/*
- * makeUniqueTypeName
- *		Generate a unique name for a prospective new type
- *
- * Given a typeName, return a new palloc'ed name by prepending underscores
- * until a non-conflicting name results.
- *
- * If tryOriginal, first try with zero underscores.
- */
-static char *
-makeUniqueTypeName(const char *typeName, Oid typeNamespace, bool tryOriginal)
-{
-	int			i;
-	int			namelen;
-	char		dest[NAMEDATALEN];
-
-	Assert(strlen(typeName) <= NAMEDATALEN - 1);
-
-	if (tryOriginal &&
-		!SearchSysCacheExists2(TYPENAMENSP,
-							   CStringGetDatum(typeName),
-							   ObjectIdGetDatum(typeNamespace)))
-		return pstrdup(typeName);
-
-	/*
-	 * The idea is to prepend underscores as needed until we make a name that
-	 * doesn't collide with anything ...
-	 */
-	namelen = strlen(typeName);
-	for (i = 1; i < NAMEDATALEN - 1; i++)
-	{
-		dest[i - 1] = '_';
-		strlcpy(dest + i, typeName, NAMEDATALEN - i);
-		if (namelen + i >= NAMEDATALEN)
-			truncate_identifier(dest, NAMEDATALEN, false);
-
-		if (!SearchSysCacheExists2(TYPENAMENSP,
-								   CStringGetDatum(dest),
-								   ObjectIdGetDatum(typeNamespace)))
-			return pstrdup(dest);
-	}
-
-	return NULL;
 }

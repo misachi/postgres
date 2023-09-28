@@ -21,9 +21,7 @@ PostgreSQL documentation
 
  <refsynopsisdiv>
 <synopsis>
-CLUSTER [VERBOSE] <replaceable class="parameter">table_name</replaceable> [ USING <replaceable class="parameter">index_name</replaceable> ]
-CLUSTER ( <replaceable class="parameter">option</replaceable> [, ...] ) <replaceable class="parameter">table_name</replaceable> [ USING <replaceable class="parameter">index_name</replaceable> ]
-CLUSTER [VERBOSE]
+CLUSTER [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] [ <replaceable class="parameter">table_name</replaceable> [ USING <replaceable class="parameter">index_name</replaceable> ] ]
 
 <phrase>where <replaceable class="parameter">option</replaceable> can be one of:</phrase>
 
@@ -67,7 +65,8 @@ CLUSTER [VERBOSE]
   </para>
 
   <para>
-   <command>CLUSTER</command> without any parameter reclusters all the
+   <command>CLUSTER</command> without a
+   <replaceable class="parameter">table_name</replaceable> reclusters all the
    previously-clustered tables in the current database that the calling user
    owns, or all such tables if called by a superuser.  This
    form of <command>CLUSTER</command> cannot be executed inside a transaction
@@ -196,6 +195,14 @@ CLUSTER [VERBOSE]
     in the <structname>pg_stat_progress_cluster</structname> view. See
     <xref linkend="cluster-progress-reporting"/> for details.
   </para>
+
+   <para>
+    Clustering a partitioned table clusters each of its partitions using the
+    partition of the specified partitioned index.  When clustering a partitioned
+    table, the index may not be omitted.  <command>CLUSTER</command> on a
+    partitioned table cannot be executed inside a transaction block.
+   </para>
+
  </refsect1>
 
  <refsect1>
@@ -232,12 +239,19 @@ CLUSTER;
   </para>
 
   <para>
-   The syntax
+   The following syntax was used before <productname>PostgreSQL</productname>
+   17 and is still supported:
+<synopsis>
+CLUSTER [ VERBOSE ] [ <replaceable class="parameter">table_name</replaceable> [ USING <replaceable class="parameter">index_name</replaceable> ] ]
+</synopsis>
+  </para>
+
+  <para>
+   The following syntax was used before <productname>PostgreSQL</productname>
+   8.3 and is still supported:
 <synopsis>
 CLUSTER <replaceable class="parameter">index_name</replaceable> ON <replaceable class="parameter">table_name</replaceable>
 </synopsis>
-  is also supported for compatibility with pre-8.3 <productname>PostgreSQL</productname>
-  versions.
   </para>
  </refsect1>
 

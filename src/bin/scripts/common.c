@@ -4,7 +4,7 @@
  *		Common support routines for bin/scripts/
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/scripts/common.c
@@ -52,7 +52,7 @@ splitTableColumnsSpec(const char *spec, int encoding,
 			cp++;
 		}
 		else
-			cp += PQmblen(cp, encoding);
+			cp += PQmblenBounded(cp, encoding);
 	}
 	*table = pnstrdup(spec, cp - spec);
 	*columns = cp;

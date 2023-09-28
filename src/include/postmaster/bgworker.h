@@ -31,7 +31,7 @@
  * different) code.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -48,6 +48,7 @@
 
 /*
  * Pass this flag to have your worker be able to connect to shared memory.
+ * This flag is required.
  */
 #define BGWORKER_SHMEM_ACCESS						0x0001
 
@@ -92,7 +93,7 @@ typedef struct BackgroundWorker
 	int			bgw_flags;
 	BgWorkerStartTime bgw_start_time;
 	int			bgw_restart_time;	/* in seconds, or BGW_NEVER_RESTART */
-	char		bgw_library_name[BGW_MAXLEN];
+	char		bgw_library_name[MAXPGPATH];
 	char		bgw_function_name[BGW_MAXLEN];
 	Datum		bgw_main_arg;
 	char		bgw_extra[BGW_EXTRALEN];
@@ -120,7 +121,7 @@ extern bool RegisterDynamicBackgroundWorker(BackgroundWorker *worker,
 /* Query the status of a bgworker */
 extern BgwHandleStatus GetBackgroundWorkerPid(BackgroundWorkerHandle *handle,
 											  pid_t *pidp);
-extern BgwHandleStatus WaitForBackgroundWorkerStartup(BackgroundWorkerHandle *handle, pid_t *pid);
+extern BgwHandleStatus WaitForBackgroundWorkerStartup(BackgroundWorkerHandle *handle, pid_t *pidp);
 extern BgwHandleStatus
 			WaitForBackgroundWorkerShutdown(BackgroundWorkerHandle *);
 extern const char *GetBackgroundWorkerTypeByPid(pid_t pid);

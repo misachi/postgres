@@ -9,7 +9,7 @@
  *	  more likely to break across PostgreSQL releases than code that uses
  *	  only the official API.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/interfaces/libpq/libpq-int.h
@@ -23,24 +23,25 @@
 /* We assume libpq-fe.h has already been included. */
 #include "libpq-events.h"
 
+#include <netdb.h>
+#include <sys/socket.h>
 #include <time.h>
-#ifndef WIN32
+/* MinGW has sys/time.h, but MSVC doesn't */
+#ifndef _MSC_VER
 #include <sys/time.h>
 #endif
 
-#ifdef ENABLE_THREAD_SAFETY
 #ifdef WIN32
 #include "pthread-win32.h"
 #else
 #include <pthread.h>
 #endif
 #include <signal.h>
-#endif
 
 /* include stuff common to fe and be */
-#include "getaddrinfo.h"
 #include "libpq/pqcomm.h"
 /* include stuff found in fe only */
+#include "fe-auth-sasl.h"
 #include "pqexpbuffer.h"
 
 #ifdef ENABLE_GSS
@@ -79,6 +80,8 @@ typedef struct
 #define USE_SSL_ENGINE
 #endif
 #endif							/* USE_OPENSSL */
+
+#include "common/pg_prng.h"
 
 /*
  * POSTGRES backend dependent Constants.
@@ -224,7 +227,8 @@ typedef enum
 								 * query */
 	PGASYNC_COPY_IN,			/* Copy In data transfer in progress */
 	PGASYNC_COPY_OUT,			/* Copy Out data transfer in progress */
-	PGASYNC_COPY_BOTH			/* Copy In/Out data transfer in progress */
+	PGASYNC_COPY_BOTH,			/* Copy In/Out data transfer in progress */
+	PGASYNC_PIPELINE_IDLE,		/* "Idle" between commands in pipeline mode */
 } PGAsyncStatusType;
 
 /* Target server type (decoded value of target_session_attrs) */
@@ -238,6 +242,13 @@ typedef enum
 	SERVER_TYPE_PREFER_STANDBY, /* Prefer standby server */
 	SERVER_TYPE_PREFER_STANDBY_PASS2	/* second pass - behaves same as ANY */
 } PGTargetServerType;
+
+/* Target server type (decoded value of load_balance_hosts) */
+typedef enum
+{
+	LOAD_BALANCE_DISABLE = 0,	/* Use the existing host order (default) */
+	LOAD_BALANCE_RANDOM,		/* Randomly shuffle the hosts */
+} PGLoadBalanceType;
 
 /* Boolean value plus a not-known state, for GUCs we might have to fetch */
 typedef enum
@@ -310,7 +321,8 @@ typedef enum
 	PGQUERY_EXTENDED,			/* full Extended protocol (PQexecParams) */
 	PGQUERY_PREPARE,			/* Parse only (PQprepare) */
 	PGQUERY_DESCRIBE,			/* Describe Statement or Portal */
-	PGQUERY_SYNC				/* Sync (at end of a pipeline) */
+	PGQUERY_SYNC,				/* Sync (at end of a pipeline) */
+	PGQUERY_CLOSE				/* Close Statement or Portal */
 } PGQueryClass;
 
 /*
@@ -380,6 +392,7 @@ struct pg_conn
 	char	   *sslkey;			/* client key filename */
 	char	   *sslcert;		/* client certificate filename */
 	char	   *sslpassword;	/* client key file password */
+	char	   *sslcertmode;	/* client cert mode (require,allow,disable) */
 	char	   *sslrootcert;	/* root certificate filename */
 	char	   *sslcrl;			/* certificate revocation list filename */
 	char	   *sslcrldir;		/* certificate revocation list directory name */
@@ -389,9 +402,12 @@ struct pg_conn
 	char	   *krbsrvname;		/* Kerberos service name */
 	char	   *gsslib;			/* What GSS library to use ("gssapi" or
 								 * "sspi") */
+	char	   *gssdelegation;	/* Try to delegate GSS credentials? (0 or 1) */
 	char	   *ssl_min_protocol_version;	/* minimum TLS protocol version */
 	char	   *ssl_max_protocol_version;	/* maximum TLS protocol version */
 	char	   *target_session_attrs;	/* desired session properties */
+	char	   *require_auth;	/* name of the expected auth method */
+	char	   *load_balance_hosts; /* load balance over hosts */
 
 	/* Optional file to write trace info to */
 	FILE	   *Pfdebug;
@@ -448,18 +464,30 @@ struct pg_conn
 	int			sversion;		/* server version, e.g. 70401 for 7.4.1 */
 	bool		auth_req_received;	/* true if any type of auth req received */
 	bool		password_needed;	/* true if server demanded a password */
+	bool		gssapi_used;	/* true if authenticated via gssapi */
 	bool		sigpipe_so;		/* have we masked SIGPIPE via SO_NOSIGPIPE? */
 	bool		sigpipe_flag;	/* can we mask SIGPIPE via MSG_NOSIGNAL? */
 	bool		write_failed;	/* have we had a write failure on sock? */
 	char	   *write_err_msg;	/* write error message, or NULL if OOM */
 
+	bool		auth_required;	/* require an authentication challenge from
+								 * the server? */
+	uint32		allowed_auth_methods;	/* bitmask of acceptable AuthRequest
+										 * codes */
+	bool		client_finished_auth;	/* have we finished our half of the
+										 * authentication exchange? */
+
+
 	/* Transient state needed while establishing connection */
 	PGTargetServerType target_server_type;	/* desired session properties */
+	PGLoadBalanceType load_balance_type;	/* desired load balancing
+											 * algorithm */
 	bool		try_next_addr;	/* time to advance to next address/host? */
 	bool		try_next_host;	/* time to advance to next connhost[]? */
-	struct addrinfo *addrlist;	/* list of addresses for current connhost */
-	struct addrinfo *addr_cur;	/* the one currently being tried */
-	int			addrlist_family;	/* needed to know how to free addrlist */
+	int			naddr;			/* number of addresses returned by getaddrinfo */
+	int			whichaddr;		/* the address currently being tried */
+	AddrInfo   *addr;			/* the array of addresses for the currently
+								 * tried host */
 	bool		send_appname;	/* okay to send application_name? */
 
 	/* Miscellaneous stuff */
@@ -473,6 +501,8 @@ struct pg_conn
 	PGVerbosity verbosity;		/* error/notice message verbosity */
 	PGContextVisibility show_context;	/* whether to show CONTEXT field */
 	PGlobjfuncs *lobjfuncs;		/* private state for large-object access fns */
+	pg_prng_state prng_state;	/* prng state for load balancing connections */
+
 
 	/* Buffer for data received from backend and not yet processed */
 	char	   *inBuffer;		/* currently allocated buffer */
@@ -495,15 +525,28 @@ struct pg_conn
 	PGdataValue *rowBuf;		/* array for passing values to rowProcessor */
 	int			rowBufLen;		/* number of entries allocated in rowBuf */
 
-	/* Status for asynchronous result construction */
+	/*
+	 * Status for asynchronous result construction.  If result isn't NULL, it
+	 * is a result being constructed or ready to return.  If result is NULL
+	 * and error_result is true, then we need to return a PGRES_FATAL_ERROR
+	 * result, but haven't yet constructed it; text for the error has been
+	 * appended to conn->errorMessage.  (Delaying construction simplifies
+	 * dealing with out-of-memory cases.)  If next_result isn't NULL, it is a
+	 * PGresult that will replace "result" after we return that one.
+	 */
 	PGresult   *result;			/* result being constructed */
+	bool		error_result;	/* do we need to make an ERROR result? */
 	PGresult   *next_result;	/* next result (used in single-row mode) */
 
 	/* Assorted state for SASL, SSL, GSS, etc */
+	const pg_fe_sasl_mech *sasl;
 	void	   *sasl_state;
+	int			scram_sha_256_iterations;
 
 	/* SSL structures */
 	bool		ssl_in_use;
+	bool		ssl_cert_requested; /* Did the server ask us for a cert? */
+	bool		ssl_cert_sent;	/* Did we send one in reply? */
 
 #ifdef USE_SSL
 	bool		allow_ssl_try;	/* Allowed to try SSL negotiation */
@@ -565,8 +608,14 @@ struct pg_conn
 	 * Buffer for current error message.  This is cleared at the start of any
 	 * connection attempt or query cycle; after that, all code should append
 	 * messages to it, never overwrite.
+	 *
+	 * In some situations we might report an error more than once in a query
+	 * cycle.  If so, errorMessage accumulates text from all the errors, and
+	 * errorReported tracks how much we've already reported, so that the
+	 * individual error PGresult objects don't contain duplicative text.
 	 */
 	PQExpBufferData errorMessage;	/* expansible string */
+	int			errorReported;	/* # bytes of string already reported */
 
 	/* Buffer for receiving various parts of messages */
 	PQExpBufferData workBuffer; /* expansible string */
@@ -581,6 +630,13 @@ struct pg_cancel
 	SockAddr	raddr;			/* Remote address */
 	int			be_pid;			/* PID of backend --- needed for cancels */
 	int			be_key;			/* key of backend --- needed for cancels */
+	int			pgtcp_user_timeout; /* tcp user timeout */
+	int			keepalives;		/* use TCP keepalives? */
+	int			keepalives_idle;	/* time between TCP keepalives */
+	int			keepalives_interval;	/* time between TCP keepalive
+										 * retransmits */
+	int			keepalives_count;	/* maximum number of TCP keepalive
+									 * retransmits */
 };
 
 
@@ -623,26 +679,14 @@ extern int	pqPacketSend(PGconn *conn, char pack_type,
 						 const void *buf, size_t buf_len);
 extern bool pqGetHomeDirectory(char *buf, int bufsize);
 
-#ifdef ENABLE_THREAD_SAFETY
 extern pgthreadlock_t pg_g_threadlock;
-
-#define PGTHREAD_ERROR(msg) \
-	do { \
-		fprintf(stderr, "%s\n", msg); \
-		abort(); \
-	} while (0)
-
 
 #define pglock_thread()		pg_g_threadlock(true)
 #define pgunlock_thread()	pg_g_threadlock(false)
-#else
-#define pglock_thread()		((void) 0)
-#define pgunlock_thread()	((void) 0)
-#endif
 
 /* === in fe-exec.c === */
 
-extern void pqSetResultError(PGresult *res, const char *msg);
+extern void pqSetResultError(PGresult *res, PQExpBuffer errorMessage, int offset);
 extern void *pqResultAlloc(PGresult *res, size_t nBytes, bool isBinary);
 extern char *pqResultStrdup(PGresult *res, const char *str);
 extern void pqClearAsyncResult(PGconn *conn);
@@ -665,6 +709,7 @@ extern void pqParseInput3(PGconn *conn);
 extern int	pqGetErrorNotice3(PGconn *conn, bool isError);
 extern void pqBuildErrorMessage3(PQExpBuffer msg, const PGresult *res,
 								 PGVerbosity verbosity, PGContextVisibility show_context);
+extern int	pqGetNegotiateProtocolVersion3(PGconn *conn);
 extern int	pqGetCopyData3(PGconn *conn, char **buffer, int async);
 extern int	pqGetline3(PGconn *conn, char *s, int maxlen);
 extern int	pqGetlineAsync3(PGconn *conn, char *buffer, int bufsize);
@@ -713,7 +758,7 @@ extern ssize_t pqsecure_write(PGconn *, const void *ptr, size_t len);
 extern ssize_t pqsecure_raw_read(PGconn *, void *ptr, size_t len);
 extern ssize_t pqsecure_raw_write(PGconn *, const void *ptr, size_t len);
 
-#if defined(ENABLE_THREAD_SAFETY) && !defined(WIN32)
+#if !defined(WIN32)
 extern int	pq_block_sigpipe(sigset_t *osigset, bool *sigpipe_pending);
 extern void pq_reset_sigpipe(sigset_t *osigset, bool sigpipe_pending,
 							 bool got_epipe);
@@ -781,14 +826,8 @@ extern ssize_t pgtls_write(PGconn *conn, const void *ptr, size_t len);
  *
  * NULL is sent back to the caller in the event of an error, with an
  * error message for the caller to consume.
- *
- * This is not supported with old versions of OpenSSL that don't have
- * the X509_get_signature_nid() function.
  */
-#if defined(USE_OPENSSL) && defined(HAVE_X509_GET_SIGNATURE_NID)
-#define HAVE_PGTLS_GET_PEER_CERTIFICATE_HASH
 extern char *pgtls_get_peer_certificate_hash(PGconn *conn, size_t *len);
-#endif
 
 /*
  * Verify that the server certificate matches the host name we connected to.
@@ -820,13 +859,28 @@ extern ssize_t pg_GSS_write(PGconn *conn, const void *ptr, size_t len);
 extern ssize_t pg_GSS_read(PGconn *conn, void *ptr, size_t len);
 #endif
 
-/* === in libpq-trace.c === */
+/* === in fe-trace.c === */
 
 extern void pqTraceOutputMessage(PGconn *conn, const char *message,
 								 bool toServer);
 extern void pqTraceOutputNoTypeByteMessage(PGconn *conn, const char *message);
 
 /* === miscellaneous macros === */
+
+/*
+ * Reset the conn's error-reporting state.
+ */
+#define pqClearConnErrorState(conn) \
+	(resetPQExpBuffer(&(conn)->errorMessage), \
+	 (conn)->errorReported = 0)
+
+/*
+ * Check whether we have a PGresult pending to be returned --- either a
+ * constructed one in conn->result, or a "virtual" error result that we
+ * don't intend to materialize until the end of the query cycle.
+ */
+#define pgHavePendingResult(conn) \
+	((conn)->result != NULL || (conn)->error_result)
 
 /*
  * this is so that we can check if a connection is non-blocking internally
@@ -846,6 +900,14 @@ extern char *libpq_ngettext(const char *msgid, const char *msgid_plural, unsigne
 #define libpq_gettext(x) (x)
 #define libpq_ngettext(s, p, n) ((n) == 1 ? (s) : (p))
 #endif
+/*
+ * libpq code should use the above, not _(), since that would use the
+ * surrounding programs's message catalog.
+ */
+#undef _
+
+extern void libpq_append_error(PQExpBuffer errorMessage, const char *fmt,...) pg_attribute_printf(2, 3);
+extern void libpq_append_conn_error(PGconn *conn, const char *fmt,...) pg_attribute_printf(2, 3);
 
 /*
  * These macros are needed to let error-handling code be portable between

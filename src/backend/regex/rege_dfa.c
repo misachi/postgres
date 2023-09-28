@@ -385,14 +385,10 @@ matchuntil(struct vars *v,
 	{
 		size_t		nchr = probe - v->start;
 
-		/*
-		 * It might seem that we should check maxmatchall too, but the .* at
-		 * the front of the pattern absorbs any extra characters (and it was
-		 * tacked on *after* computing minmatchall/maxmatchall).  Thus, we
-		 * should match if there are at least minmatchall characters.
-		 */
 		if (nchr < d->cnfa->minmatchall)
 			return 0;
+		/* maxmatchall will always be infinity, cf. makesearch() */
+		assert(d->cnfa->maxmatchall == DUPINF);
 		return 1;
 	}
 
@@ -809,11 +805,7 @@ miss(struct vars *v,
 	 * Checking for operation cancel in the inner text search loop seems
 	 * unduly expensive.  As a compromise, check during cache misses.
 	 */
-	if (CANCEL_REQUESTED(v->re))
-	{
-		ERR(REG_CANCEL);
-		return NULL;
-	}
+	INTERRUPT(v->re);
 
 	/*
 	 * What set of states would we end up in after consuming the co character?

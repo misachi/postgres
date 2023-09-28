@@ -4,7 +4,7 @@
  *	  This file contains definitions for structures and
  *	  externs for functions used by frontend postgres applications.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/interfaces/libpq/libpq-fe.h
@@ -27,6 +27,17 @@ extern "C"
  * such as Oid.
  */
 #include "postgres_ext.h"
+
+/*
+ * These symbols may be used in compile-time #ifdef tests for the availability
+ * of newer libpq features.
+ */
+/* Indicates presence of PQenterPipelineMode and friends */
+#define LIBPQ_HAS_PIPELINING 1
+/* Indicates presence of PQsetTraceFlags; also new PQtrace output format */
+#define LIBPQ_HAS_TRACE_FLAGS 1
+/* Indicates that PQsslAttribute(NULL, "library") is useful */
+#define LIBPQ_HAS_SSL_LIBRARY_DETECTION 1
 
 /*
  * Option flags for PQcopyResult
@@ -98,7 +109,7 @@ typedef enum
 	PGRES_COPY_BOTH,			/* Copy In/Out data transfer in progress */
 	PGRES_SINGLE_TUPLE,			/* single tuple from larger resultset */
 	PGRES_PIPELINE_SYNC,		/* pipeline synchronization point */
-	PGRES_PIPELINE_ABORTED,		/* Command didn't run because of an abort
+	PGRES_PIPELINE_ABORTED		/* Command didn't run because of an abort
 								 * earlier in a pipeline */
 } ExecStatusType;
 
@@ -343,6 +354,7 @@ extern int	PQbackendPID(const PGconn *conn);
 extern PGpipelineStatus PQpipelineStatus(const PGconn *conn);
 extern int	PQconnectionNeedsPassword(const PGconn *conn);
 extern int	PQconnectionUsedPassword(const PGconn *conn);
+extern int	PQconnectionUsedGSSAPI(const PGconn *conn);
 extern int	PQclientEncoding(const PGconn *conn);
 extern int	PQsetClientEncoding(PGconn *conn, const char *encoding);
 
@@ -398,12 +410,12 @@ extern pgthreadlock_t PQregisterThreadLock(pgthreadlock_t newhandler);
 extern void PQtrace(PGconn *conn, FILE *debug_port);
 extern void PQuntrace(PGconn *conn);
 
-/* flags controlling trace output */
+/* flags controlling trace output: */
 /* omit timestamps from each line */
 #define PQTRACE_SUPPRESS_TIMESTAMPS		(1<<0)
 /* redact portions of some messages, for testing frameworks */
 #define PQTRACE_REGRESS_MODE			(1<<1)
-extern void PQtraceSetFlags(PGconn *conn, int flags);
+extern void PQsetTraceFlags(PGconn *conn, int flags);
 
 /* === in fe-exec.c === */
 
@@ -429,6 +441,8 @@ extern PGresult *PQexecPrepared(PGconn *conn,
 								int resultFormat);
 
 /* Interface for multiple-result or asynchronous queries */
+#define PQ_QUERY_PARAM_MAX_LIMIT 65535
+
 extern int	PQsendQuery(PGconn *conn, const char *query);
 extern int	PQsendQueryParams(PGconn *conn,
 							  const char *command,
@@ -459,6 +473,7 @@ extern int	PQconsumeInput(PGconn *conn);
 extern int	PQenterPipelineMode(PGconn *conn);
 extern int	PQexitPipelineMode(PGconn *conn);
 extern int	PQpipelineSync(PGconn *conn);
+extern int	PQsendFlushRequest(PGconn *conn);
 
 /* LISTEN/NOTIFY support */
 extern PGnotify *PQnotifies(PGconn *conn);
@@ -469,7 +484,7 @@ extern int	PQputCopyEnd(PGconn *conn, const char *errormsg);
 extern int	PQgetCopyData(PGconn *conn, char **buffer, int async);
 
 /* Deprecated routines for copy in/out */
-extern int	PQgetline(PGconn *conn, char *string, int length);
+extern int	PQgetline(PGconn *conn, char *buffer, int length);
 extern int	PQputline(PGconn *conn, const char *string);
 extern int	PQgetlineAsync(PGconn *conn, char *buffer, int bufsize);
 extern int	PQputnbytes(PGconn *conn, const char *buffer, int nbytes);
@@ -533,6 +548,12 @@ extern PGresult *PQdescribePortal(PGconn *conn, const char *portal);
 extern int	PQsendDescribePrepared(PGconn *conn, const char *stmt);
 extern int	PQsendDescribePortal(PGconn *conn, const char *portal);
 
+/* Close prepared statements and portals */
+extern PGresult *PQclosePrepared(PGconn *conn, const char *stmt);
+extern PGresult *PQclosePortal(PGconn *conn, const char *portal);
+extern int	PQsendClosePrepared(PGconn *conn, const char *stmt);
+extern int	PQsendClosePortal(PGconn *conn, const char *portal);
+
 /* Delete a PGresult */
 extern void PQclear(PGresult *res);
 
@@ -577,7 +598,7 @@ extern unsigned char *PQescapeBytea(const unsigned char *from, size_t from_lengt
 
 extern void PQprint(FILE *fout, /* output stream */
 					const PGresult *res,
-					const PQprintOpt *ps);	/* option structure */
+					const PQprintOpt *po);	/* option structure */
 
 /*
  * really old printing routines
@@ -624,6 +645,9 @@ extern int	PQlibVersion(void);
 
 /* Determine length of multibyte encoded char at *s */
 extern int	PQmblen(const char *s, int encoding);
+
+/* Same, but not more than the distance to the end of string s */
+extern int	PQmblenBounded(const char *s, int encoding);
 
 /* Determine display length of multibyte encoded char at *s */
 extern int	PQdsplen(const char *s, int encoding);

@@ -4,7 +4,7 @@
  *	  prototypes for tablecmds.c.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/commands/tablecmds.h
@@ -60,13 +60,14 @@ extern void ExecuteTruncateGuts(List *explicit_rels,
 								List *relids,
 								List *relids_logged,
 								DropBehavior behavior,
-								bool restart_seqs);
+								bool restart_seqs,
+								bool run_as_table_owner);
 
 extern void SetRelationHasSubclass(Oid relationId, bool relhassubclass);
 
 extern bool CheckRelationTableSpaceMove(Relation rel, Oid newTableSpaceId);
 extern void SetRelationTableSpace(Relation rel, Oid newTableSpaceId,
-								  Oid newRelFileNode);
+								  RelFileNumber newRelFilenumber);
 
 extern ObjectAddress renameatt(RenameStmt *stmt);
 
@@ -77,6 +78,8 @@ extern ObjectAddress RenameRelation(RenameStmt *stmt);
 extern void RenameRelationInternal(Oid myrelid,
 								   const char *newrelname, bool is_internal,
 								   bool is_index);
+
+extern void ResetRelRewrite(Oid myrelid);
 
 extern void find_composite_type_dependencies(Oid typeOid,
 											 Relation origRelation,

@@ -4,7 +4,7 @@
  *	  prototypes for functions in backend/catalog/heap.c
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/heap.h
@@ -34,10 +34,11 @@ typedef struct RawColumnDefault
 
 typedef struct CookedConstraint
 {
-	ConstrType	contype;		/* CONSTR_DEFAULT or CONSTR_CHECK */
+	ConstrType	contype;		/* CONSTR_DEFAULT, CONSTR_CHECK,
+								 * CONSTR_NOTNULL */
 	Oid			conoid;			/* constr OID if created, otherwise Invalid */
 	char	   *name;			/* name, or NULL if none */
-	AttrNumber	attnum;			/* which attr (only for DEFAULT) */
+	AttrNumber	attnum;			/* which attr (only for NOTNULL, DEFAULT) */
 	Node	   *expr;			/* transformed default or check expr */
 	bool		skip_validation;	/* skip validation? (only for CHECK) */
 	bool		is_local;		/* constraint has local (non-inherited) def */
@@ -50,7 +51,7 @@ extern Relation heap_create(const char *relname,
 							Oid relnamespace,
 							Oid reltablespace,
 							Oid relid,
-							Oid relfilenode,
+							RelFileNumber relfilenumber,
 							Oid accessmtd,
 							TupleDesc tupDesc,
 							char relkind,
@@ -59,7 +60,8 @@ extern Relation heap_create(const char *relname,
 							bool mapped_relation,
 							bool allow_system_table_mods,
 							TransactionId *relfrozenxid,
-							MultiXactId *relminmxid);
+							MultiXactId *relminmxid,
+							bool create_storage);
 
 extern Oid	heap_create_with_catalog(const char *relname,
 									 Oid relnamespace,
@@ -96,7 +98,7 @@ extern List *heap_truncate_find_FKs(List *relationIds);
 extern void InsertPgAttributeTuples(Relation pg_attribute_rel,
 									TupleDesc tupdesc,
 									Oid new_rel_oid,
-									Datum *attoptions,
+									const Datum *attoptions,
 									CatalogIndexState indstate);
 
 extern void InsertPgClassTuple(Relation pg_class_desc,
@@ -112,13 +114,12 @@ extern List *AddRelationNewConstraints(Relation rel,
 									   bool is_local,
 									   bool is_internal,
 									   const char *queryString);
+extern List *AddRelationNotNullConstraints(Relation rel,
+										   List *constraints,
+										   List *additional_notnulls);
 
 extern void RelationClearMissing(Relation rel);
 extern void SetAttrMissing(Oid relid, char *attname, char *value);
-
-extern Oid	StoreAttrDefault(Relation rel, AttrNumber attnum,
-							 Node *expr, bool is_internal,
-							 bool add_column_mode);
 
 extern Node *cookDefault(ParseState *pstate,
 						 Node *raw_default,
@@ -131,9 +132,7 @@ extern void DeleteRelationTuple(Oid relid);
 extern void DeleteAttributeTuples(Oid relid);
 extern void DeleteSystemAttributeTuples(Oid relid);
 extern void RemoveAttributeById(Oid relid, AttrNumber attnum);
-extern void RemoveAttrDefault(Oid relid, AttrNumber attnum,
-							  DropBehavior behavior, bool complain, bool internal);
-extern void RemoveAttrDefaultById(Oid attrdefId);
+
 extern void CopyStatistics(Oid fromrelid, Oid torelid);
 extern void RemoveStatistics(Oid relid, AttrNumber attnum);
 

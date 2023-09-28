@@ -35,6 +35,23 @@ SELECT * FROM test1;
  55
 (1 row)
 
+-- Check that plan revalidation doesn't prevent setting transaction properties
+-- (bug #18059).  This test must include the first temp-object creation in
+-- this script, or it won't exercise the bug scenario.  Hence we put it early.
+CREATE PROCEDURE test_proc3a()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+   COMMIT;
+   SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+   RAISE NOTICE 'done';
+END;
+$$;
+CALL test_proc3a();
+NOTICE:  done
+CREATE TEMP TABLE tt1(f1 int);
+CALL test_proc3a();
+NOTICE:  done
 -- nested CALL
 TRUNCATE TABLE test1;
 CREATE PROCEDURE test_proc4(y int)
@@ -100,9 +117,12 @@ DECLARE
 BEGIN
     CALL test_proc6(2, x, y);
     RAISE INFO 'x = %, y = %', x, y;
+    CALL test_proc6(2, c => y, b => x);
+    RAISE INFO 'x = %, y = %', x, y;
 END;
 $$;
 INFO:  x = 6, y = 8
+INFO:  x = 12, y = 16
 DO
 LANGUAGE plpgsql
 $$
@@ -115,6 +135,18 @@ BEGIN
 END;
 $$;
 ERROR:  procedure parameter "b" is an output parameter but corresponding argument is not writable
+CONTEXT:  PL/pgSQL function inline_code_block line 6 at CALL
+DO
+LANGUAGE plpgsql
+$$
+DECLARE
+    x constant int := 3;
+    y int := 4;
+BEGIN
+    CALL test_proc6(2, x, y);  -- error because x is constant
+END;
+$$;
+ERROR:  variable "x" is declared CONSTANT
 CONTEXT:  PL/pgSQL function inline_code_block line 6 at CALL
 DO
 LANGUAGE plpgsql
@@ -304,6 +336,79 @@ END
 $$;
 NOTICE:  a: 10, b: <NULL>
 NOTICE:  _a: 10, _b: 20
+CREATE PROCEDURE test_proc10(IN a int, OUT b int, IN c int DEFAULT 11)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE NOTICE 'a: %, b: %, c: %', a, b, c;
+  b := a - c;
+END;
+$$;
+DO $$
+DECLARE _a int; _b int; _c int;
+BEGIN
+  _a := 10; _b := 30; _c := 7;
+  CALL test_proc10(_a, _b, _c);
+  RAISE NOTICE '_a: %, _b: %, _c: %', _a, _b, _c;
+
+  _a := 10; _b := 30; _c := 7;
+  CALL test_proc10(_a, _b, c => _c);
+  RAISE NOTICE '_a: %, _b: %, _c: %', _a, _b, _c;
+
+  _a := 10; _b := 30; _c := 7;
+  CALL test_proc10(a => _a, b => _b, c => _c);
+  RAISE NOTICE '_a: %, _b: %, _c: %', _a, _b, _c;
+
+  _a := 10; _b := 30; _c := 7;
+  CALL test_proc10(_a, c => _c, b => _b);
+  RAISE NOTICE '_a: %, _b: %, _c: %', _a, _b, _c;
+
+  _a := 10; _b := 30; _c := 7;
+  CALL test_proc10(_a, _b);
+  RAISE NOTICE '_a: %, _b: %, _c: %', _a, _b, _c;
+
+  _a := 10; _b := 30; _c := 7;
+  CALL test_proc10(_a, b => _b);
+  RAISE NOTICE '_a: %, _b: %, _c: %', _a, _b, _c;
+
+  _a := 10; _b := 30; _c := 7;
+  CALL test_proc10(b => _b, a => _a);
+  RAISE NOTICE '_a: %, _b: %, _c: %', _a, _b, _c;
+END
+$$;
+NOTICE:  a: 10, b: <NULL>, c: 7
+NOTICE:  _a: 10, _b: 3, _c: 7
+NOTICE:  a: 10, b: <NULL>, c: 7
+NOTICE:  _a: 10, _b: 3, _c: 7
+NOTICE:  a: 10, b: <NULL>, c: 7
+NOTICE:  _a: 10, _b: 3, _c: 7
+NOTICE:  a: 10, b: <NULL>, c: 7
+NOTICE:  _a: 10, _b: 3, _c: 7
+NOTICE:  a: 10, b: <NULL>, c: 11
+NOTICE:  _a: 10, _b: -1, _c: 7
+NOTICE:  a: 10, b: <NULL>, c: 11
+NOTICE:  _a: 10, _b: -1, _c: 7
+NOTICE:  a: 10, b: <NULL>, c: 11
+NOTICE:  _a: 10, _b: -1, _c: 7
+-- OUT + VARIADIC
+CREATE PROCEDURE test_proc11(a OUT int, VARIADIC b int[])
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE NOTICE 'a: %, b: %', a, b;
+  a := b[1] + b[2];
+END;
+$$;
+DO $$
+DECLARE _a int; _b int; _c int;
+BEGIN
+  _a := 10; _b := 30; _c := 7;
+  CALL test_proc11(_a, _b, _c);
+  RAISE NOTICE '_a: %, _b: %, _c: %', _a, _b, _c;
+END
+$$;
+NOTICE:  a: <NULL>, b: {30,7}
+NOTICE:  _a: 37, _b: 30, _c: 7
 -- transition variable assignment
 TRUNCATE test1;
 CREATE FUNCTION triggerfunc1() RETURNS trigger
@@ -378,3 +483,50 @@ BEGIN
 END;
 $$;
 NOTICE:  <NULL>
+-- check that we detect change of dependencies in CALL
+-- atomic and non-atomic call sites used to do this differently, so check both
+CREATE PROCEDURE inner_p (f1 int)
+AS $$
+BEGIN
+  RAISE NOTICE 'inner_p(%)', f1;
+END
+$$ LANGUAGE plpgsql;
+CREATE FUNCTION f(int) RETURNS int AS $$ SELECT $1 + 1 $$ LANGUAGE sql;
+CREATE PROCEDURE outer_p (f1 int)
+AS $$
+BEGIN
+  RAISE NOTICE 'outer_p(%)', f1;
+  CALL inner_p(f(f1));
+END
+$$ LANGUAGE plpgsql;
+CREATE FUNCTION outer_f (f1 int) RETURNS void
+AS $$
+BEGIN
+  RAISE NOTICE 'outer_f(%)', f1;
+  CALL inner_p(f(f1));
+END
+$$ LANGUAGE plpgsql;
+CALL outer_p(42);
+NOTICE:  outer_p(42)
+NOTICE:  inner_p(43)
+SELECT outer_f(42);
+NOTICE:  outer_f(42)
+NOTICE:  inner_p(43)
+ outer_f 
+---------
+ 
+(1 row)
+
+DROP FUNCTION f(int);
+CREATE FUNCTION f(int) RETURNS int AS $$ SELECT $1 + 2 $$ LANGUAGE sql;
+CALL outer_p(42);
+NOTICE:  outer_p(42)
+NOTICE:  inner_p(44)
+SELECT outer_f(42);
+NOTICE:  outer_f(42)
+NOTICE:  inner_p(44)
+ outer_f 
+---------
+ 
+(1 row)
+

@@ -6,7 +6,7 @@
  * for developers.  If you edit any of these, be sure to do a *full*
  * rebuild (and an initdb if noted).
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/pg_config_manual.h
@@ -41,6 +41,23 @@
  * backend recompile (including any user-defined C functions).
  */
 #define FUNC_MAX_ARGS		100
+
+/*
+ * When creating a product derived from PostgreSQL with changes that cause
+ * incompatibilities for loadable modules, it is recommended to change this
+ * string so that dfmgr.c can refuse to load incompatible modules with a clean
+ * error message.  Typical examples that cause incompatibilities are any
+ * changes to node tags or node structures.  (Note that dfmgr.c already
+ * detects common sources of incompatibilities due to major version
+ * differences and due to some changed compile-time constants.  This setting
+ * is for catching anything that cannot be detected in a straightforward way.)
+ *
+ * There is no prescribed format for the string.  The suggestion is to include
+ * product or company name, and optionally any internally-relevant ABI
+ * version.  Example: "ACME Postgres/1.2".  Note that the string will appear
+ * in a user-facing error message if an ABI mismatch is detected.
+ */
+#define FMGR_ABI_EXTRA		"PostgreSQL"
 
 /*
  * Maximum number of columns in an index.  There is little point in making
@@ -98,17 +115,6 @@
 #define MAXPGPATH		1024
 
 /*
- * PG_SOMAXCONN: maximum accept-queue length limit passed to
- * listen(2).  You'd think we should use SOMAXCONN from
- * <sys/socket.h>, but on many systems that symbol is much smaller
- * than the kernel's actual limit.  In any case, this symbol need be
- * twiddled only if you have a kernel that refuses large limit values,
- * rather than silently reducing the value to what it can handle
- * (which is what most if not all Unixen do).
- */
-#define PG_SOMAXCONN	10000
-
-/*
  * You can try changing this if you have a machine with bytes of
  * another size, but no guarantee...
  */
@@ -133,13 +139,6 @@
  */
 #if defined(WIN32) && !defined(__CYGWIN__)
 #define EXEC_BACKEND
-#endif
-
-/*
- * Define this if your operating system supports link()
- */
-#if !defined(WIN32) && !defined(__CYGWIN__)
-#define HAVE_WORKING_LINK 1
 #endif
 
 /*
@@ -218,52 +217,21 @@
 #define DEFAULT_EVENT_SOURCE  "PostgreSQL"
 
 /*
- * The random() function is expected to yield values between 0 and
- * MAX_RANDOM_VALUE.  Currently, all known implementations yield
- * 0..2^31-1, so we just hardwire this constant.  We could do a
- * configure test if it proves to be necessary.  CAUTION: Think not to
- * replace this with RAND_MAX.  RAND_MAX defines the maximum value of
- * the older rand() function, which is often different from --- and
- * considerably inferior to --- random().
- */
-#define MAX_RANDOM_VALUE  PG_INT32_MAX
-
-/*
- * On PPC machines, decide whether to use the mutex hint bit in LWARX
- * instructions.  Setting the hint bit will slightly improve spinlock
- * performance on POWER6 and later machines, but does nothing before that,
- * and will result in illegal-instruction failures on some pre-POWER4
- * machines.  By default we use the hint bit when building for 64-bit PPC,
- * which should be safe in nearly all cases.  You might want to override
- * this if you are building 32-bit code for a known-recent PPC machine.
- */
-#ifdef HAVE_PPC_LWARX_MUTEX_HINT	/* must have assembler support in any case */
-#if defined(__ppc64__) || defined(__powerpc64__)
-#define USE_PPC_LWARX_MUTEX_HINT
-#endif
-#endif
-
-/*
- * On PPC machines, decide whether to use LWSYNC instructions in place of
- * ISYNC and SYNC.  This provides slightly better performance, but will
- * result in illegal-instruction failures on some pre-POWER4 machines.
- * By default we use LWSYNC when building for 64-bit PPC, which should be
- * safe in nearly all cases.
- */
-#if defined(__ppc64__) || defined(__powerpc64__)
-#define USE_PPC_LWSYNC
-#endif
-
-/*
- * Assumed cache line size. This doesn't affect correctness, but can be used
- * for low-level optimizations. Currently, this is used to pad some data
- * structures in xlog.c, to ensure that highly-contended fields are on
- * different cache lines. Too small a value can hurt performance due to false
- * sharing, while the only downside of too large a value is a few bytes of
- * wasted memory. The default is 128, which should be large enough for all
- * supported platforms.
+ * Assumed cache line size.  This doesn't affect correctness, but can be used
+ * for low-level optimizations.  This is mostly used to pad various data
+ * structures, to ensure that highly-contended fields are on different cache
+ * lines.  Too small a value can hurt performance due to false sharing, while
+ * the only downside of too large a value is a few bytes of wasted memory.
+ * The default is 128, which should be large enough for all supported
+ * platforms.
  */
 #define PG_CACHE_LINE_SIZE		128
+
+/*
+ * Assumed alignment requirement for direct I/O.  4K corresponds to common
+ * sector and memory page size.
+ */
+#define PG_IO_ALIGN_SIZE		4096
 
 /*
  *------------------------------------------------------------------------
@@ -322,36 +290,36 @@
 /* #define RANDOMIZE_ALLOCATED_MEMORY */
 
 /*
- * For cache invalidation debugging, define CLOBBER_CACHE_ENABLED to enable
- * use of the debug_invalidate_system_caches_always GUC to aggressively flush
- * syscache/relcache entries whenever it's possible to deliver invalidations.
- * See AcceptInvalidationMessages() in src/backend/utils/cache/inval.c for
+ * For cache-invalidation debugging, define DISCARD_CACHES_ENABLED to enable
+ * use of the debug_discard_caches GUC to aggressively flush syscache/relcache
+ * entries whenever it's possible to deliver invalidations.  See
+ * AcceptInvalidationMessages() in src/backend/utils/cache/inval.c for
  * details.
  *
  * USE_ASSERT_CHECKING builds default to enabling this.  It's possible to use
- * CLOBBER_CACHE_ENABLED without a cassert build and the implied
- * CLOBBER_FREED_MEMORY and MEMORY_CONTEXT_CHECKING options but it's unlikely
+ * DISCARD_CACHES_ENABLED without a cassert build and the implied
+ * CLOBBER_FREED_MEMORY and MEMORY_CONTEXT_CHECKING options, but it's unlikely
  * to be as effective at identifying problems.
  */
-/* #define CLOBBER_CACHE_ENABLED */
+/* #define DISCARD_CACHES_ENABLED */
 
-#if defined(USE_ASSERT_CHECKING) && !defined(CLOBBER_CACHE_ENABLED)
-#define CLOBBER_CACHE_ENABLED
+#if defined(USE_ASSERT_CHECKING) && !defined(DISCARD_CACHES_ENABLED)
+#define DISCARD_CACHES_ENABLED
 #endif
 
 /*
- * Backwards compatibility for the older compile-time-only cache clobber
+ * Backwards compatibility for the older compile-time-only clobber-cache
  * macros.
  */
-#if !defined(CLOBBER_CACHE_ENABLED) && (defined(CLOBBER_CACHE_ALWAYS) || defined(CLOBBER_CACHE_RECURSIVELY))
-#define CLOBBER_CACHE_ENABLED
+#if !defined(DISCARD_CACHES_ENABLED) && (defined(CLOBBER_CACHE_ALWAYS) || defined(CLOBBER_CACHE_RECURSIVELY))
+#define DISCARD_CACHES_ENABLED
 #endif
 
 /*
  * Recover memory used for relcache entries when invalidated.  See
- * RelationBuildDescr() in src/backend/utils/cache/relcache.c.
+ * RelationBuildDesc() in src/backend/utils/cache/relcache.c.
  *
- * This is active automatically for clobber cache builds when clobbering is
+ * This is active automatically for clobber-cache builds when clobbering is
  * active, but can be overridden here by explicitly defining
  * RECOVER_RELATION_BUILD_MEMORY.  Define to 1 to always free relation cache
  * memory even when clobber is off, or to 0 to never free relation cache

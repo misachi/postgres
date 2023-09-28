@@ -3,7 +3,7 @@
  * nodeNamedtuplestorescan.c
  *	  routines to handle NamedTuplestoreScan nodes.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -153,28 +153,6 @@ ExecInitNamedTuplestoreScan(NamedTuplestoreScan *node, EState *estate, int eflag
 		ExecInitQual(node->scan.plan.qual, (PlanState *) scanstate);
 
 	return scanstate;
-}
-
-/* ----------------------------------------------------------------
- *		ExecEndNamedTuplestoreScan
- *
- *		frees any storage allocated through C routines.
- * ----------------------------------------------------------------
- */
-void
-ExecEndNamedTuplestoreScan(NamedTuplestoreScanState *node)
-{
-	/*
-	 * Free exprcontext
-	 */
-	ExecFreeExprContext(&node->ss.ps);
-
-	/*
-	 * clean out the tuple table
-	 */
-	if (node->ss.ps.ps_ResultTupleSlot)
-		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 }
 
 /* ----------------------------------------------------------------

@@ -5,13 +5,19 @@
  *
  * A bitmap set can represent any set of nonnegative integers, although
  * it is mainly intended for sets where the maximum value is not large,
- * say at most a few hundred.  By convention, a NULL pointer is always
- * accepted by all operations to represent the empty set.  (But beware
- * that this is not the only representation of the empty set.  Use
- * bms_is_empty() in preference to testing for NULL.)
+ * say at most a few hundred.  By convention, we always represent a set with
+ * the minimum possible number of words, i.e, there are never any trailing
+ * zero words.  Enforcing this requires that an empty set is represented as
+ * NULL.  Because an empty Bitmapset is represented as NULL, a non-NULL
+ * Bitmapset always has at least 1 Bitmapword.  We can exploit this fact to
+ * speed up various loops over the Bitmapset's words array by using "do while"
+ * loops instead of "for" loops.  This means the code does not waste time
+ * checking the loop condition before the first iteration.  For Bitmapsets
+ * containing only a single word (likely the majority of them) this halves the
+ * number of loop condition checks.
  *
  *
- * Copyright (c) 2003-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2003-2023, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/nodes/bitmapset.c
@@ -85,53 +91,38 @@ bms_copy(const Bitmapset *a)
 }
 
 /*
- * bms_equal - are two bitmapsets equal?
- *
- * This is logical not physical equality; in particular, a NULL pointer will
- * be reported as equal to a palloc'd value containing no members.
+ * bms_equal - are two bitmapsets equal? or both NULL?
  */
 bool
 bms_equal(const Bitmapset *a, const Bitmapset *b)
 {
-	const Bitmapset *shorter;
-	const Bitmapset *longer;
-	int			shortlen;
-	int			longlen;
 	int			i;
+
+	Assert(a == NULL || a->words[a->nwords - 1] != 0);
+	Assert(b == NULL || b->words[b->nwords - 1] != 0);
 
 	/* Handle cases where either input is NULL */
 	if (a == NULL)
 	{
 		if (b == NULL)
 			return true;
-		return bms_is_empty(b);
+		return false;
 	}
 	else if (b == NULL)
-		return bms_is_empty(a);
-	/* Identify shorter and longer input */
-	if (a->nwords <= b->nwords)
+		return false;
+
+	/* can't be equal if the word counts don't match */
+	if (a->nwords != b->nwords)
+		return false;
+
+	/* check each word matches */
+	i = 0;
+	do
 	{
-		shorter = a;
-		longer = b;
-	}
-	else
-	{
-		shorter = b;
-		longer = a;
-	}
-	/* And process */
-	shortlen = shorter->nwords;
-	for (i = 0; i < shortlen; i++)
-	{
-		if (shorter->words[i] != longer->words[i])
+		if (a->words[i] != b->words[i])
 			return false;
-	}
-	longlen = longer->nwords;
-	for (; i < longlen; i++)
-	{
-		if (longer->words[i] != 0)
-			return false;
-	}
+	} while (++i < a->nwords);
+
 	return true;
 }
 
@@ -146,36 +137,30 @@ bms_equal(const Bitmapset *a, const Bitmapset *b)
 int
 bms_compare(const Bitmapset *a, const Bitmapset *b)
 {
-	int			shortlen;
 	int			i;
+
+	Assert(a == NULL || a->words[a->nwords - 1] != 0);
+	Assert(b == NULL || b->words[b->nwords - 1] != 0);
 
 	/* Handle cases where either input is NULL */
 	if (a == NULL)
-		return bms_is_empty(b) ? 0 : -1;
+		return (b == NULL) ? 0 : -1;
 	else if (b == NULL)
-		return bms_is_empty(a) ? 0 : +1;
-	/* Handle cases where one input is longer than the other */
-	shortlen = Min(a->nwords, b->nwords);
-	for (i = shortlen; i < a->nwords; i++)
-	{
-		if (a->words[i] != 0)
-			return +1;
-	}
-	for (i = shortlen; i < b->nwords; i++)
-	{
-		if (b->words[i] != 0)
-			return -1;
-	}
-	/* Process words in common */
-	i = shortlen;
-	while (--i >= 0)
+		return +1;
+
+	/* the set with the most words must be greater */
+	if (a->nwords != b->nwords)
+		return (a->nwords > b->nwords) ? +1 : -1;
+
+	i = a->nwords - 1;
+	do
 	{
 		bitmapword	aw = a->words[i];
 		bitmapword	bw = b->words[i];
 
 		if (aw != bw)
 			return (aw > bw) ? +1 : -1;
-	}
+	} while (--i >= 0);
 	return 0;
 }
 
@@ -194,6 +179,7 @@ bms_make_singleton(int x)
 	wordnum = WORDNUM(x);
 	bitnum = BITNUM(x);
 	result = (Bitmapset *) palloc0(BITMAPSET_SIZE(wordnum + 1));
+	result->type = T_Bitmapset;
 	result->nwords = wordnum + 1;
 	result->words[wordnum] = ((bitmapword) 1 << bitnum);
 	return result;
@@ -247,8 +233,11 @@ bms_union(const Bitmapset *a, const Bitmapset *b)
 	}
 	/* And union the shorter input into the result */
 	otherlen = other->nwords;
-	for (i = 0; i < otherlen; i++)
+	i = 0;
+	do
+	{
 		result->words[i] |= other->words[i];
+	} while (++i < otherlen);
 	return result;
 }
 
@@ -260,6 +249,7 @@ bms_intersect(const Bitmapset *a, const Bitmapset *b)
 {
 	Bitmapset  *result;
 	const Bitmapset *other;
+	int			lastnonzero;
 	int			resultlen;
 	int			i;
 
@@ -279,8 +269,24 @@ bms_intersect(const Bitmapset *a, const Bitmapset *b)
 	}
 	/* And intersect the longer input with the result */
 	resultlen = result->nwords;
-	for (i = 0; i < resultlen; i++)
+	lastnonzero = -1;
+	i = 0;
+	do
+	{
 		result->words[i] &= other->words[i];
+
+		if (result->words[i] != 0)
+			lastnonzero = i;
+	} while (++i < resultlen);
+	/* If we computed an empty result, we must return NULL */
+	if (lastnonzero == -1)
+	{
+		pfree(result);
+		return NULL;
+	}
+
+	/* get rid of trailing zero words */
+	result->nwords = lastnonzero + 1;
 	return result;
 }
 
@@ -291,20 +297,62 @@ Bitmapset *
 bms_difference(const Bitmapset *a, const Bitmapset *b)
 {
 	Bitmapset  *result;
-	int			shortlen;
 	int			i;
+
+	Assert(a == NULL || a->words[a->nwords - 1] != 0);
+	Assert(b == NULL || b->words[b->nwords - 1] != 0);
 
 	/* Handle cases where either input is NULL */
 	if (a == NULL)
 		return NULL;
 	if (b == NULL)
 		return bms_copy(a);
+
+	/*
+	 * In Postgres' usage, an empty result is a very common case, so it's
+	 * worth optimizing for that by testing bms_nonempty_difference().  This
+	 * saves us a palloc/pfree cycle compared to checking after-the-fact.
+	 */
+	if (!bms_nonempty_difference(a, b))
+		return NULL;
+
 	/* Copy the left input */
 	result = bms_copy(a);
+
 	/* And remove b's bits from result */
-	shortlen = Min(a->nwords, b->nwords);
-	for (i = 0; i < shortlen; i++)
-		result->words[i] &= ~b->words[i];
+	if (result->nwords > b->nwords)
+	{
+		/*
+		 * We'll never need to remove trailing zero words when 'a' has more
+		 * words than 'b' as the additional words must be non-zero.
+		 */
+		i = 0;
+		do
+		{
+			result->words[i] &= ~b->words[i];
+		} while (++i < b->nwords);
+	}
+	else
+	{
+		int			lastnonzero = -1;
+
+		/* we may need to remove trailing zero words from the result. */
+		i = 0;
+		do
+		{
+			result->words[i] &= ~b->words[i];
+
+			/* remember the last non-zero word */
+			if (result->words[i] != 0)
+				lastnonzero = i;
+		} while (++i < result->nwords);
+
+		/* trim off trailing zero words */
+		result->nwords = lastnonzero + 1;
+	}
+	Assert(result->nwords != 0);
+
+	/* Need not check for empty result, since we handled that case above */
 	return result;
 }
 
@@ -314,32 +362,28 @@ bms_difference(const Bitmapset *a, const Bitmapset *b)
 bool
 bms_is_subset(const Bitmapset *a, const Bitmapset *b)
 {
-	int			shortlen;
-	int			longlen;
 	int			i;
+
+	Assert(a == NULL || a->words[a->nwords - 1] != 0);
+	Assert(b == NULL || b->words[b->nwords - 1] != 0);
 
 	/* Handle cases where either input is NULL */
 	if (a == NULL)
 		return true;			/* empty set is a subset of anything */
 	if (b == NULL)
-		return bms_is_empty(a);
-	/* Check common words */
-	shortlen = Min(a->nwords, b->nwords);
-	for (i = 0; i < shortlen; i++)
+		return false;
+
+	/* 'a' can't be a subset of 'b' if it contains more words */
+	if (a->nwords > b->nwords)
+		return false;
+
+	/* Check all 'a' members are set in 'b' */
+	i = 0;
+	do
 	{
 		if ((a->words[i] & ~b->words[i]) != 0)
 			return false;
-	}
-	/* Check extra words */
-	if (a->nwords > b->nwords)
-	{
-		longlen = a->nwords;
-		for (; i < longlen; i++)
-		{
-			if (a->words[i] != 0)
-				return false;
-		}
-	}
+	} while (++i < a->nwords);
 	return true;
 }
 
@@ -353,22 +397,25 @@ bms_subset_compare(const Bitmapset *a, const Bitmapset *b)
 {
 	BMS_Comparison result;
 	int			shortlen;
-	int			longlen;
 	int			i;
+
+	Assert(a == NULL || a->words[a->nwords - 1] != 0);
+	Assert(b == NULL || b->words[b->nwords - 1] != 0);
 
 	/* Handle cases where either input is NULL */
 	if (a == NULL)
 	{
 		if (b == NULL)
 			return BMS_EQUAL;
-		return bms_is_empty(b) ? BMS_EQUAL : BMS_SUBSET1;
+		return BMS_SUBSET1;
 	}
 	if (b == NULL)
-		return bms_is_empty(a) ? BMS_EQUAL : BMS_SUBSET2;
+		return BMS_SUBSET2;
 	/* Check common words */
 	result = BMS_EQUAL;			/* status so far */
 	shortlen = Min(a->nwords, b->nwords);
-	for (i = 0; i < shortlen; i++)
+	i = 0;
+	do
 	{
 		bitmapword	aword = a->words[i];
 		bitmapword	bword = b->words[i];
@@ -387,35 +434,21 @@ bms_subset_compare(const Bitmapset *a, const Bitmapset *b)
 				return BMS_DIFFERENT;
 			result = BMS_SUBSET1;
 		}
-	}
+	} while (++i < shortlen);
 	/* Check extra words */
 	if (a->nwords > b->nwords)
 	{
-		longlen = a->nwords;
-		for (; i < longlen; i++)
-		{
-			if (a->words[i] != 0)
-			{
-				/* a is not a subset of b */
-				if (result == BMS_SUBSET1)
-					return BMS_DIFFERENT;
-				result = BMS_SUBSET2;
-			}
-		}
+		/* if a has more words then a is not a subset of b */
+		if (result == BMS_SUBSET1)
+			return BMS_DIFFERENT;
+		return BMS_SUBSET2;
 	}
 	else if (a->nwords < b->nwords)
 	{
-		longlen = b->nwords;
-		for (; i < longlen; i++)
-		{
-			if (b->words[i] != 0)
-			{
-				/* b is not a subset of a */
-				if (result == BMS_SUBSET2)
-					return BMS_DIFFERENT;
-				result = BMS_SUBSET1;
-			}
-		}
+		/* if b has more words then b is not a subset of a */
+		if (result == BMS_SUBSET2)
+			return BMS_DIFFERENT;
+		return BMS_SUBSET1;
 	}
 	return result;
 }
@@ -501,11 +534,12 @@ bms_overlap(const Bitmapset *a, const Bitmapset *b)
 		return false;
 	/* Check words in common */
 	shortlen = Min(a->nwords, b->nwords);
-	for (i = 0; i < shortlen; i++)
+	i = 0;
+	do
 	{
 		if ((a->words[i] & b->words[i]) != 0)
 			return true;
-	}
+	} while (++i < shortlen);
 	return false;
 }
 
@@ -540,31 +574,32 @@ bms_overlap_list(const Bitmapset *a, const List *b)
 
 /*
  * bms_nonempty_difference - do sets have a nonempty difference?
+ *
+ * i.e., are any members set in 'a' that are not also set in 'b'.
  */
 bool
 bms_nonempty_difference(const Bitmapset *a, const Bitmapset *b)
 {
-	int			shortlen;
 	int			i;
+
+	Assert(a == NULL || a->words[a->nwords - 1] != 0);
+	Assert(b == NULL || b->words[b->nwords - 1] != 0);
 
 	/* Handle cases where either input is NULL */
 	if (a == NULL)
 		return false;
 	if (b == NULL)
-		return !bms_is_empty(a);
-	/* Check words in common */
-	shortlen = Min(a->nwords, b->nwords);
-	for (i = 0; i < shortlen; i++)
+		return true;
+	/* if 'a' has more words then it must contain additional members */
+	if (a->nwords > b->nwords)
+		return true;
+	/* Check all 'a' members are set in 'b' */
+	i = 0;
+	do
 	{
 		if ((a->words[i] & ~b->words[i]) != 0)
 			return true;
-	}
-	/* Check extra words in a */
-	for (; i < a->nwords; i++)
-	{
-		if (a->words[i] != 0)
-			return true;
-	}
+	} while (++i < a->nwords);
 	return false;
 }
 
@@ -583,7 +618,8 @@ bms_singleton_member(const Bitmapset *a)
 	if (a == NULL)
 		elog(ERROR, "bitmapset is empty");
 	nwords = a->nwords;
-	for (wordnum = 0; wordnum < nwords; wordnum++)
+	wordnum = 0;
+	do
 	{
 		bitmapword	w = a->words[wordnum];
 
@@ -594,9 +630,10 @@ bms_singleton_member(const Bitmapset *a)
 			result = wordnum * BITS_PER_BITMAPWORD;
 			result += bmw_rightmost_one_pos(w);
 		}
-	}
-	if (result < 0)
-		elog(ERROR, "bitmapset is empty");
+	} while (++wordnum < nwords);
+
+	/* we don't expect non-NULL sets to be empty */
+	Assert(result >= 0);
 	return result;
 }
 
@@ -621,7 +658,8 @@ bms_get_singleton_member(const Bitmapset *a, int *member)
 	if (a == NULL)
 		return false;
 	nwords = a->nwords;
-	for (wordnum = 0; wordnum < nwords; wordnum++)
+	wordnum = 0;
+	do
 	{
 		bitmapword	w = a->words[wordnum];
 
@@ -632,9 +670,10 @@ bms_get_singleton_member(const Bitmapset *a, int *member)
 			result = wordnum * BITS_PER_BITMAPWORD;
 			result += bmw_rightmost_one_pos(w);
 		}
-	}
-	if (result < 0)
-		return false;
+	} while (++wordnum < nwords);
+
+	/* we don't expect non-NULL sets to be empty */
+	Assert(result >= 0);
 	*member = result;
 	return true;
 }
@@ -652,14 +691,15 @@ bms_num_members(const Bitmapset *a)
 	if (a == NULL)
 		return 0;
 	nwords = a->nwords;
-	for (wordnum = 0; wordnum < nwords; wordnum++)
+	wordnum = 0;
+	do
 	{
 		bitmapword	w = a->words[wordnum];
 
 		/* No need to count the bits in a zero word */
 		if (w != 0)
 			result += bmw_popcount(w);
-	}
+	} while (++wordnum < nwords);
 	return result;
 }
 
@@ -678,7 +718,8 @@ bms_membership(const Bitmapset *a)
 	if (a == NULL)
 		return BMS_EMPTY_SET;
 	nwords = a->nwords;
-	for (wordnum = 0; wordnum < nwords; wordnum++)
+	wordnum = 0;
+	do
 	{
 		bitmapword	w = a->words[wordnum];
 
@@ -688,32 +729,8 @@ bms_membership(const Bitmapset *a)
 				return BMS_MULTIPLE;
 			result = BMS_SINGLETON;
 		}
-	}
+	} while (++wordnum < nwords);
 	return result;
-}
-
-/*
- * bms_is_empty - is a set empty?
- *
- * This is even faster than bms_membership().
- */
-bool
-bms_is_empty(const Bitmapset *a)
-{
-	int			nwords;
-	int			wordnum;
-
-	if (a == NULL)
-		return true;
-	nwords = a->nwords;
-	for (wordnum = 0; wordnum < nwords; wordnum++)
-	{
-		bitmapword	w = a->words[wordnum];
-
-		if (w != 0)
-			return false;
-	}
-	return true;
 }
 
 
@@ -754,8 +771,11 @@ bms_add_member(Bitmapset *a, int x)
 		a = (Bitmapset *) repalloc(a, BITMAPSET_SIZE(wordnum + 1));
 		a->nwords = wordnum + 1;
 		/* zero out the enlarged portion */
-		for (i = oldnwords; i < a->nwords; i++)
+		i = oldnwords;
+		do
+		{
 			a->words[i] = 0;
+		} while (++i < a->nwords);
 	}
 
 	a->words[wordnum] |= ((bitmapword) 1 << bitnum);
@@ -781,8 +801,30 @@ bms_del_member(Bitmapset *a, int x)
 		return NULL;
 	wordnum = WORDNUM(x);
 	bitnum = BITNUM(x);
-	if (wordnum < a->nwords)
-		a->words[wordnum] &= ~((bitmapword) 1 << bitnum);
+
+	/* member can't exist.  Return 'a' unmodified */
+	if (unlikely(wordnum >= a->nwords))
+		return a;
+
+	a->words[wordnum] &= ~((bitmapword) 1 << bitnum);
+
+	/* when last word becomes empty, trim off all trailing empty words */
+	if (a->words[wordnum] == 0 && wordnum == a->nwords - 1)
+	{
+		/* find the last non-empty word and make that the new final word */
+		for (int i = wordnum - 1; i >= 0; i--)
+		{
+			if (a->words[i] != 0)
+			{
+				a->nwords = i + 1;
+				return a;
+			}
+		}
+
+		/* the set is now empty */
+		pfree(a);
+		return NULL;
+	}
 	return a;
 }
 
@@ -815,8 +857,11 @@ bms_add_members(Bitmapset *a, const Bitmapset *b)
 	}
 	/* And union the shorter input into the result */
 	otherlen = other->nwords;
-	for (i = 0; i < otherlen; i++)
+	i = 0;
+	do
+	{
 		result->words[i] |= other->words[i];
+	} while (++i < otherlen);
 	if (result != a)
 		pfree(a);
 	return result;
@@ -850,6 +895,7 @@ bms_add_range(Bitmapset *a, int lower, int upper)
 	if (a == NULL)
 	{
 		a = (Bitmapset *) palloc0(BITMAPSET_SIZE(uwordnum + 1));
+		a->type = T_Bitmapset;
 		a->nwords = uwordnum + 1;
 	}
 	else if (uwordnum >= a->nwords)
@@ -861,8 +907,11 @@ bms_add_range(Bitmapset *a, int lower, int upper)
 		a = (Bitmapset *) repalloc(a, BITMAPSET_SIZE(uwordnum + 1));
 		a->nwords = uwordnum + 1;
 		/* zero out the enlarged portion */
-		for (i = oldnwords; i < a->nwords; i++)
+		i = oldnwords;
+		do
+		{
 			a->words[i] = 0;
+		} while (++i < a->nwords);
 	}
 
 	wordnum = lwordnum = WORDNUM(lower);
@@ -901,6 +950,7 @@ bms_add_range(Bitmapset *a, int lower, int upper)
 Bitmapset *
 bms_int_members(Bitmapset *a, const Bitmapset *b)
 {
+	int			lastnonzero;
 	int			shortlen;
 	int			i;
 
@@ -914,10 +964,25 @@ bms_int_members(Bitmapset *a, const Bitmapset *b)
 	}
 	/* Intersect b into a; we need never copy */
 	shortlen = Min(a->nwords, b->nwords);
-	for (i = 0; i < shortlen; i++)
+	lastnonzero = -1;
+	i = 0;
+	do
+	{
 		a->words[i] &= b->words[i];
-	for (; i < a->nwords; i++)
-		a->words[i] = 0;
+
+		if (a->words[i] != 0)
+			lastnonzero = i;
+	} while (++i < shortlen);
+
+	/* If we computed an empty result, we must return NULL */
+	if (lastnonzero == -1)
+	{
+		pfree(a);
+		return NULL;
+	}
+
+	/* get rid of trailing zero words */
+	a->nwords = lastnonzero + 1;
 	return a;
 }
 
@@ -927,8 +992,10 @@ bms_int_members(Bitmapset *a, const Bitmapset *b)
 Bitmapset *
 bms_del_members(Bitmapset *a, const Bitmapset *b)
 {
-	int			shortlen;
 	int			i;
+
+	Assert(a == NULL || a->words[a->nwords - 1] != 0);
+	Assert(b == NULL || b->words[b->nwords - 1] != 0);
 
 	/* Handle cases where either input is NULL */
 	if (a == NULL)
@@ -936,9 +1003,44 @@ bms_del_members(Bitmapset *a, const Bitmapset *b)
 	if (b == NULL)
 		return a;
 	/* Remove b's bits from a; we need never copy */
-	shortlen = Min(a->nwords, b->nwords);
-	for (i = 0; i < shortlen; i++)
-		a->words[i] &= ~b->words[i];
+	if (a->nwords > b->nwords)
+	{
+		/*
+		 * We'll never need to remove trailing zero words when 'a' has more
+		 * words than 'b'.
+		 */
+		i = 0;
+		do
+		{
+			a->words[i] &= ~b->words[i];
+		} while (++i < b->nwords);
+	}
+	else
+	{
+		int			lastnonzero = -1;
+
+		/* we may need to remove trailing zero words from the result. */
+		i = 0;
+		do
+		{
+			a->words[i] &= ~b->words[i];
+
+			/* remember the last non-zero word */
+			if (a->words[i] != 0)
+				lastnonzero = i;
+		} while (++i < a->nwords);
+
+		/* check if 'a' has become empty */
+		if (lastnonzero == -1)
+		{
+			pfree(a);
+			return NULL;
+		}
+
+		/* trim off any trailing zero words */
+		a->nwords = lastnonzero + 1;
+	}
+
 	return a;
 }
 
@@ -971,53 +1073,14 @@ bms_join(Bitmapset *a, Bitmapset *b)
 	}
 	/* And union the shorter input into the result */
 	otherlen = other->nwords;
-	for (i = 0; i < otherlen; i++)
+	i = 0;
+	do
+	{
 		result->words[i] |= other->words[i];
+	} while (++i < otherlen);
 	if (other != result)		/* pure paranoia */
 		pfree(other);
 	return result;
-}
-
-/*
- * bms_first_member - find and remove first member of a set
- *
- * Returns -1 if set is empty.  NB: set is destructively modified!
- *
- * This is intended as support for iterating through the members of a set.
- * The typical pattern is
- *
- *			while ((x = bms_first_member(inputset)) >= 0)
- *				process member x;
- *
- * CAUTION: this destroys the content of "inputset".  If the set must
- * not be modified, use bms_next_member instead.
- */
-int
-bms_first_member(Bitmapset *a)
-{
-	int			nwords;
-	int			wordnum;
-
-	if (a == NULL)
-		return -1;
-	nwords = a->nwords;
-	for (wordnum = 0; wordnum < nwords; wordnum++)
-	{
-		bitmapword	w = a->words[wordnum];
-
-		if (w != 0)
-		{
-			int			result;
-
-			w = RIGHTMOST_ONE(w);
-			a->words[wordnum] &= ~w;
-
-			result = wordnum * BITS_PER_BITMAPWORD;
-			result += bmw_rightmost_one_pos(w);
-			return result;
-		}
-	}
-	return -1;
 }
 
 /*
@@ -1144,28 +1207,14 @@ bms_prev_member(const Bitmapset *a, int prevbit)
 
 /*
  * bms_hash_value - compute a hash key for a Bitmapset
- *
- * Note: we must ensure that any two bitmapsets that are bms_equal() will
- * hash to the same value; in practice this means that trailing all-zero
- * words must not affect the result.  Hence we strip those before applying
- * hash_any().
  */
 uint32
 bms_hash_value(const Bitmapset *a)
 {
-	int			lastword;
-
 	if (a == NULL)
 		return 0;				/* All empty sets hash to 0 */
-	for (lastword = a->nwords; --lastword >= 0;)
-	{
-		if (a->words[lastword] != 0)
-			break;
-	}
-	if (lastword < 0)
-		return 0;				/* All empty sets hash to 0 */
 	return DatumGetUInt32(hash_any((const unsigned char *) a->words,
-								   (lastword + 1) * sizeof(bitmapword)));
+								   a->nwords * sizeof(bitmapword)));
 }
 
 /*

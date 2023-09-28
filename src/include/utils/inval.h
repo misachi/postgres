@@ -4,7 +4,7 @@
  *	  POSTGRES cache invalidation dispatcher definitions.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/inval.h
@@ -15,10 +15,10 @@
 #define INVAL_H
 
 #include "access/htup.h"
-#include "storage/relfilenode.h"
+#include "storage/relfilelocator.h"
 #include "utils/relcache.h"
 
-extern PGDLLIMPORT int debug_invalidate_system_caches_always;
+extern PGDLLIMPORT int debug_discard_caches;
 
 typedef void (*SyscacheCallbackFunction) (Datum arg, int cacheid, uint32 hashvalue);
 typedef void (*RelcacheCallbackFunction) (Datum arg, Oid relid);
@@ -48,7 +48,7 @@ extern void CacheInvalidateRelcacheByTuple(HeapTuple classTuple);
 
 extern void CacheInvalidateRelcacheByRelid(Oid relid);
 
-extern void CacheInvalidateSmgr(RelFileNodeBackend rnode);
+extern void CacheInvalidateSmgr(RelFileLocatorBackend rlocator);
 
 extern void CacheInvalidateRelmap(Oid databaseId);
 
@@ -62,6 +62,7 @@ extern void CacheRegisterRelcacheCallback(RelcacheCallbackFunction func,
 extern void CallSyscacheCallbacks(int cacheid, uint32 hashvalue);
 
 extern void InvalidateSystemCaches(void);
+extern void InvalidateSystemCachesExtended(bool debug_discard);
 
 extern void LogLogicalInvalidations(void);
 #endif							/* INVAL_H */

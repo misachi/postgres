@@ -7,7 +7,7 @@
  *	 ExecProcNode, or ExecEndNode on its subnodes and do the appropriate
  *	 processing.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -94,6 +94,7 @@
 #include "executor/nodeLimit.h"
 #include "executor/nodeLockRows.h"
 #include "executor/nodeMaterial.h"
+#include "executor/nodeMemoize.h"
 #include "executor/nodeMergeAppend.h"
 #include "executor/nodeMergejoin.h"
 #include "executor/nodeModifyTable.h"
@@ -102,7 +103,6 @@
 #include "executor/nodeProjectSet.h"
 #include "executor/nodeRecursiveunion.h"
 #include "executor/nodeResult.h"
-#include "executor/nodeResultCache.h"
 #include "executor/nodeSamplescan.h"
 #include "executor/nodeSeqscan.h"
 #include "executor/nodeSetOp.h"
@@ -121,6 +121,7 @@
 
 static TupleTableSlot *ExecProcNodeFirst(PlanState *node);
 static TupleTableSlot *ExecProcNodeInstr(PlanState *node);
+static bool ExecShutdownNode_walker(PlanState *node, void *context);
 
 
 /* ------------------------------------------------------------------------
@@ -326,9 +327,9 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 														   estate, eflags);
 			break;
 
-		case T_ResultCache:
-			result = (PlanState *) ExecInitResultCache((ResultCache *) node,
-													   estate, eflags);
+		case T_Memoize:
+			result = (PlanState *) ExecInitMemoize((Memoize *) node, estate,
+												   eflags);
 			break;
 
 		case T_Group:
@@ -666,20 +667,8 @@ ExecEndNode(PlanState *node)
 			ExecEndTableFuncScan((TableFuncScanState *) node);
 			break;
 
-		case T_ValuesScanState:
-			ExecEndValuesScan((ValuesScanState *) node);
-			break;
-
 		case T_CteScanState:
 			ExecEndCteScan((CteScanState *) node);
-			break;
-
-		case T_NamedTuplestoreScanState:
-			ExecEndNamedTuplestoreScan((NamedTuplestoreScanState *) node);
-			break;
-
-		case T_WorkTableScanState:
-			ExecEndWorkTableScan((WorkTableScanState *) node);
 			break;
 
 		case T_ForeignScanState:
@@ -720,8 +709,8 @@ ExecEndNode(PlanState *node)
 			ExecEndIncrementalSort((IncrementalSortState *) node);
 			break;
 
-		case T_ResultCacheState:
-			ExecEndResultCache((ResultCacheState *) node);
+		case T_MemoizeState:
+			ExecEndMemoize((MemoizeState *) node);
 			break;
 
 		case T_GroupState:
@@ -756,6 +745,12 @@ ExecEndNode(PlanState *node)
 			ExecEndLimit((LimitState *) node);
 			break;
 
+			/* No clean up actions for these nodes. */
+		case T_ValuesScanState:
+		case T_NamedTuplestoreScanState:
+		case T_WorkTableScanState:
+			break;
+
 		default:
 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(node));
 			break;
@@ -768,8 +763,14 @@ ExecEndNode(PlanState *node)
  * Give execution nodes a chance to stop asynchronous resource consumption
  * and release any resources still held.
  */
-bool
+void
 ExecShutdownNode(PlanState *node)
+{
+	(void) ExecShutdownNode_walker(node, NULL);
+}
+
+static bool
+ExecShutdownNode_walker(PlanState *node, void *context)
 {
 	if (node == NULL)
 		return false;
@@ -789,7 +790,7 @@ ExecShutdownNode(PlanState *node)
 	if (node->instrument && node->instrument->running)
 		InstrStartNode(node->instrument);
 
-	planstate_tree_walker(node, ExecShutdownNode, NULL);
+	planstate_tree_walker(node, ExecShutdownNode_walker, context);
 
 	switch (nodeTag(node))
 	{

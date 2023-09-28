@@ -66,7 +66,7 @@ COMMENT ON
   TRIGGER <replaceable class="parameter">trigger_name</replaceable> ON <replaceable class="parameter">table_name</replaceable> |
   TYPE <replaceable class="parameter">object_name</replaceable> |
   VIEW <replaceable class="parameter">object_name</replaceable>
-} IS '<replaceable class="parameter">text</replaceable>'
+} IS { <replaceable class="parameter">string_literal</replaceable> | NULL }
 
 <phrase>where <replaceable>aggregate_signature</replaceable> is:</phrase>
 
@@ -91,10 +91,16 @@ COMMENT ON
   </para>
 
   <para>
+   A <literal>SHARE UPDATE EXCLUSIVE</literal> lock is acquired on the
+   object to be commented.
+  </para>
+
+  <para>
    For most kinds of object, only the object's owner can set the comment.
    Roles don't have owners, so the rule for <literal>COMMENT ON ROLE</literal> is
    that you must be superuser to comment on a superuser role, or have the
-   <literal>CREATEROLE</literal> privilege to comment on non-superuser roles.
+   <literal>CREATEROLE</literal> privilege and have been granted
+   <literal>ADMIN OPTION</literal> on the target role.
    Likewise, access methods don't have owners either; you must be superuser
    to comment on an access method.
    Of course, a superuser can comment on anything.
@@ -129,10 +135,8 @@ COMMENT ON
     <term><replaceable class="parameter">trigger_name</replaceable></term>
     <listitem>
      <para>
-      The name of the object to be commented.  Names of tables,
-      aggregates, collations, conversions, domains, foreign tables, functions,
-      indexes, operators, operator classes, operator families, procedures, routines, sequences,
-      statistics, text search objects, types, and views can be
+      The name of the object to be commented.  Names of objects that reside in
+      schemas (tables, functions, etc.) can be
       schema-qualified. When commenting on a column,
       <replaceable class="parameter">relation_name</replaceable> must refer
       to a table, view, composite type, or foreign table.
@@ -178,12 +182,11 @@ COMMENT ON
       argument: <literal>IN</literal>, <literal>OUT</literal>,
       <literal>INOUT</literal>, or <literal>VARIADIC</literal>.
       If omitted, the default is <literal>IN</literal>.
-      Note that <command>COMMENT</command> does not actually pay any attention
-      to <literal>OUT</literal> arguments for functions and aggregates (but
-      not procedures), since only the input arguments are needed to determine
-      the function's identity.  So it is sufficient to list the
-      <literal>IN</literal>, <literal>INOUT</literal>, and
-      <literal>VARIADIC</literal> arguments for functions and aggregates.
+      Note that <command>COMMENT</command> does not actually pay
+      any attention to <literal>OUT</literal> arguments, since only the input
+      arguments are needed to determine the function's identity.
+      So it is sufficient to list the <literal>IN</literal>, <literal>INOUT</literal>,
+      and <literal>VARIADIC</literal> arguments.
      </para>
     </listitem>
    </varlistentry>
@@ -260,11 +263,19 @@ COMMENT ON
     </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="parameter">text</replaceable></term>
+    <term><replaceable class="parameter">string_literal</replaceable></term>
     <listitem>
      <para>
-      The new comment, written as a string literal; or <literal>NULL</literal>
-      to drop the comment.
+      The new comment contents, written as a string literal.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><literal>NULL</literal></term>
+    <listitem>
+     <para>
+      Write <literal>NULL</literal> to drop the comment.
      </para>
     </listitem>
    </varlistentry>
@@ -347,7 +358,7 @@ COMMENT ON TEXT SEARCH CONFIGURATION my_config IS 'Special word filtering';
 COMMENT ON TEXT SEARCH DICTIONARY swedish IS 'Snowball stemmer for Swedish language';
 COMMENT ON TEXT SEARCH PARSER my_parser IS 'Splits text into words';
 COMMENT ON TEXT SEARCH TEMPLATE snowball IS 'Snowball stemmer';
-COMMENT ON TRANSFORM FOR hstore LANGUAGE plpythonu IS 'Transform between hstore and Python dict';
+COMMENT ON TRANSFORM FOR hstore LANGUAGE plpython3u IS 'Transform between hstore and Python dict';
 COMMENT ON TRIGGER my_trigger ON my_table IS 'Used for RI';
 COMMENT ON TYPE complex IS 'Complex number data type';
 COMMENT ON VIEW my_view IS 'View of departmental costs';

@@ -4,7 +4,7 @@
  *	  page utilities routines for the postgres inverted index access method.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -78,7 +78,7 @@ ginTraverseLock(Buffer buffer, bool searchMode)
  */
 GinBtreeStack *
 ginFindLeafPage(GinBtree btree, bool searchMode,
-				bool rootConflictCheck, Snapshot snapshot)
+				bool rootConflictCheck)
 {
 	GinBtreeStack *stack;
 
@@ -100,7 +100,6 @@ ginFindLeafPage(GinBtree btree, bool searchMode,
 		stack->off = InvalidOffsetNumber;
 
 		page = BufferGetPage(stack->buffer);
-		TestForOldSnapshot(snapshot, btree->index, page);
 
 		access = ginTraverseLock(stack->buffer, searchMode);
 
@@ -127,7 +126,6 @@ ginFindLeafPage(GinBtree btree, bool searchMode,
 			stack->buffer = ginStepRight(stack->buffer, btree->index, access);
 			stack->blkno = rightlink;
 			page = BufferGetPage(stack->buffer);
-			TestForOldSnapshot(snapshot, btree->index, page);
 
 			if (!searchMode && GinPageIsIncompleteSplit(page))
 				ginFinishSplit(btree, stack, false, NULL);
@@ -470,7 +468,7 @@ ginPlaceToPage(GinBtree btree, GinBtreeStack *stack,
 		savedRightLink = GinPageGetOpaque(page)->rightlink;
 
 		/* Begin setting up WAL record */
-		data.node = btree->index->rd_node;
+		data.locator = btree->index->rd_locator;
 		data.flags = xlflags;
 		if (BufferIsValid(childbuf))
 		{
@@ -527,7 +525,6 @@ ginPlaceToPage(GinBtree btree, GinBtreeStack *stack,
 									   BufferGetBlockNumber(stack->buffer),
 									   BufferGetBlockNumber(rbuffer));
 			}
-
 		}
 		else
 		{

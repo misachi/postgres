@@ -3,7 +3,7 @@
  * dependencies.c
  *	  POSTGRES functional dependencies
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -24,12 +24,14 @@
 #include "nodes/pathnodes.h"
 #include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
+#include "parser/parsetree.h"
 #include "statistics/extended_stats_internal.h"
 #include "statistics/statistics.h"
 #include "utils/bytea.h"
 #include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/selfuncs.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
@@ -197,7 +199,6 @@ DependencyGenerator_free(DependencyGenerator state)
 {
 	pfree(state->dependencies);
 	pfree(state);
-
 }
 
 /* generate next combination */
@@ -325,12 +326,6 @@ dependency_degree(StatsBuildData *data, int k, AttrNumber *dependency)
 		group_size++;
 	}
 
-	if (items)
-		pfree(items);
-
-	pfree(mss);
-	pfree(attnums_dep);
-
 	/* Compute the 'degree of validity' as (supporting/total). */
 	return (n_supporting_rows * 1.0 / data->numrows);
 }
@@ -359,8 +354,14 @@ statext_dependencies_build(StatsBuildData *data)
 
 	/* result */
 	MVDependencies *dependencies = NULL;
+	MemoryContext cxt;
 
 	Assert(data->nattnums >= 2);
+
+	/* tracks memory allocated by dependency_degree calls */
+	cxt = AllocSetContextCreate(CurrentMemoryContext,
+								"dependency_degree cxt",
+								ALLOCSET_DEFAULT_SIZES);
 
 	/*
 	 * We'll try build functional dependencies starting from the smallest ones
@@ -380,9 +381,16 @@ statext_dependencies_build(StatsBuildData *data)
 		{
 			double		degree;
 			MVDependency *d;
+			MemoryContext oldcxt;
+
+			/* release memory used by dependency degree calculation */
+			oldcxt = MemoryContextSwitchTo(cxt);
 
 			/* compute how valid the dependency seems */
 			degree = dependency_degree(data, k, dependency);
+
+			MemoryContextSwitchTo(oldcxt);
+			MemoryContextReset(cxt);
 
 			/*
 			 * if the dependency seems entirely invalid, don't store it
@@ -424,6 +432,8 @@ statext_dependencies_build(StatsBuildData *data)
 		 */
 		DependencyGenerator_free(DependencyGenerator);
 	}
+
+	MemoryContextDelete(cxt);
 
 	return dependencies;
 }
@@ -499,7 +509,7 @@ statext_dependencies_deserialize(bytea *data)
 		return NULL;
 
 	if (VARSIZE_ANY_EXHDR(data) < SizeOfHeader)
-		elog(ERROR, "invalid MVDependencies size %zd (expected at least %zd)",
+		elog(ERROR, "invalid MVDependencies size %zu (expected at least %zu)",
 			 VARSIZE_ANY_EXHDR(data), SizeOfHeader);
 
 	/* read the MVDependencies header */
@@ -531,7 +541,7 @@ statext_dependencies_deserialize(bytea *data)
 	min_expected_size = SizeOfItem(dependencies->ndeps);
 
 	if (VARSIZE_ANY_EXHDR(data) < min_expected_size)
-		elog(ERROR, "invalid dependencies size %zd (expected at least %zd)",
+		elog(ERROR, "invalid dependencies size %zu (expected at least %zu)",
 			 VARSIZE_ANY_EXHDR(data), min_expected_size);
 
 	/* allocate space for the MCV items */
@@ -608,14 +618,16 @@ dependency_is_fully_matched(MVDependency *dependency, Bitmapset *attnums)
  *		Load the functional dependencies for the indicated pg_statistic_ext tuple
  */
 MVDependencies *
-statext_dependencies_load(Oid mvoid)
+statext_dependencies_load(Oid mvoid, bool inh)
 {
 	MVDependencies *result;
 	bool		isnull;
 	Datum		deps;
 	HeapTuple	htup;
 
-	htup = SearchSysCache1(STATEXTDATASTXOID, ObjectIdGetDatum(mvoid));
+	htup = SearchSysCache2(STATEXTDATASTXOID,
+						   ObjectIdGetDatum(mvoid),
+						   BoolGetDatum(inh));
 	if (!HeapTupleIsValid(htup))
 		elog(ERROR, "cache lookup failed for statistics object %u", mvoid);
 
@@ -1151,13 +1163,12 @@ clauselist_apply_dependencies(PlannerInfo *root, List *clauses,
  *		Determines if the expression is compatible with functional dependencies
  *
  * Similar to dependency_is_compatible_clause, but doesn't enforce that the
- * expression is a simple Var. OTOH we check that there's at least one
- * statistics object matching the expression.
+ * expression is a simple Var.  On success, return the matching statistics
+ * expression into *expr.
  */
 static bool
 dependency_is_compatible_expression(Node *clause, Index relid, List *statlist, Node **expr)
 {
-	List	   *vars;
 	ListCell   *lc,
 			   *lc2;
 	Node	   *clause_expr;
@@ -1253,7 +1264,6 @@ dependency_is_compatible_expression(Node *clause, Index relid, List *statlist, N
 	else if (is_orclause(clause))
 	{
 		BoolExpr   *bool_expr = (BoolExpr *) clause;
-		ListCell   *lc;
 
 		/* start with no expression (we'll use the first match) */
 		*expr = NULL;
@@ -1305,29 +1315,8 @@ dependency_is_compatible_expression(Node *clause, Index relid, List *statlist, N
 	if (IsA(clause_expr, RelabelType))
 		clause_expr = (Node *) ((RelabelType *) clause_expr)->arg;
 
-	vars = pull_var_clause(clause_expr, 0);
-
-	foreach(lc, vars)
-	{
-		Var		   *var = (Var *) lfirst(lc);
-
-		/* Ensure Var is from the correct relation */
-		if (var->varno != relid)
-			return false;
-
-		/* We also better ensure the Var is from the current level */
-		if (var->varlevelsup != 0)
-			return false;
-
-		/* Also ignore system attributes (we don't allow stats on those) */
-		if (!AttrNumberIsForUserDefinedAttr(var->varattno))
-			return false;
-	}
-
 	/*
-	 * Check if we actually have a matching statistics for the expression.
-	 *
-	 * XXX Maybe this is an overkill. We'll eliminate the expressions later.
+	 * Search for a matching statistics expression.
 	 */
 	foreach(lc, statlist)
 	{
@@ -1400,6 +1389,7 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 	int			ndependencies;
 	int			i;
 	AttrNumber	attnum_offset;
+	RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
 
 	/* unique expressions */
 	Node	  **unique_exprs;
@@ -1588,6 +1578,10 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 		if (stat->kind != STATS_EXT_DEPENDENCIES)
 			continue;
 
+		/* skip statistics with mismatching stxdinherit value */
+		if (stat->inherit != rte->inh)
+			continue;
+
 		/*
 		 * Count matching attributes - we have to undo the attnum offsets. The
 		 * input attribute numbers are not offset (expressions are not
@@ -1634,7 +1628,7 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 		if (nmatched + nexprs < 2)
 			continue;
 
-		deps = statext_dependencies_load(stat->statOid);
+		deps = statext_dependencies_load(stat->statOid, rte->inh);
 
 		/*
 		 * The expressions may be represented by different attnums in the
@@ -1676,7 +1670,6 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 				{
 					int			idx;
 					Node	   *expr;
-					int			k;
 					AttrNumber	unique_attnum = InvalidAttrNumber;
 					AttrNumber	attnum;
 
@@ -1724,15 +1717,15 @@ dependencies_clauselist_selectivity(PlannerInfo *root,
 					expr = (Node *) list_nth(stat->exprs, idx);
 
 					/* try to find the expression in the unique list */
-					for (k = 0; k < unique_exprs_cnt; k++)
+					for (int m = 0; m < unique_exprs_cnt; m++)
 					{
 						/*
 						 * found a matching unique expression, use the attnum
 						 * (derived from index of the unique expression)
 						 */
-						if (equal(unique_exprs[k], expr))
+						if (equal(unique_exprs[m], expr))
 						{
-							unique_attnum = -(k + 1) + attnum_offset;
+							unique_attnum = -(m + 1) + attnum_offset;
 							break;
 						}
 					}

@@ -3,7 +3,7 @@
  * fastpath.c
  *	  routines to handle function requests from the frontend
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -20,6 +20,7 @@
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/objectaccess.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
@@ -68,7 +69,7 @@ SendFunctionResult(Datum retval, bool isnull, Oid rettype, int16 format)
 {
 	StringInfoData buf;
 
-	pq_beginmessage(&buf, 'V');
+	pq_beginmessage(&buf, PqMsg_FunctionCallResponse);
 
 	if (isnull)
 	{
@@ -145,7 +146,7 @@ fetch_fp_info(Oid func_id, struct fp_info *fip)
 	if (pp->prokind != PROKIND_FUNCTION || pp->proretset)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot call function %s via fastpath interface",
+				 errmsg("cannot call function \"%s\" via fastpath interface",
 						NameStr(pp->proname))));
 
 	/* watch out for catalog entries with more than FUNC_MAX_ARGS args */
@@ -239,13 +240,13 @@ HandleFunctionRequest(StringInfo msgBuf)
 	 * Check permission to access and call function.  Since we didn't go
 	 * through a normal name lookup, we need to check schema usage too.
 	 */
-	aclresult = pg_namespace_aclcheck(fip->namespace, GetUserId(), ACL_USAGE);
+	aclresult = object_aclcheck(NamespaceRelationId, fip->namespace, GetUserId(), ACL_USAGE);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_SCHEMA,
 					   get_namespace_name(fip->namespace));
 	InvokeNamespaceSearchHook(fip->namespace, true);
 
-	aclresult = pg_proc_aclcheck(fid, GetUserId(), ACL_EXECUTE);
+	aclresult = object_aclcheck(ProcedureRelationId, fid, GetUserId(), ACL_EXECUTE);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_FUNCTION,
 					   get_func_name(fid));

@@ -1,204 +1,7 @@
 --
 -- CREATE_TABLE
 --
---
--- CLASS DEFINITIONS
---
-CREATE TABLE hobbies_r (
-	name		text,
-	person 		text
-);
-CREATE TABLE equipment_r (
-	name 		text,
-	hobby		text
-);
-CREATE TABLE onek (
-	unique1		int4,
-	unique2		int4,
-	two			int4,
-	four		int4,
-	ten			int4,
-	twenty		int4,
-	hundred		int4,
-	thousand	int4,
-	twothousand	int4,
-	fivethous	int4,
-	tenthous	int4,
-	odd			int4,
-	even		int4,
-	stringu1	name,
-	stringu2	name,
-	string4		name
-);
-CREATE TABLE tenk1 (
-	unique1		int4,
-	unique2		int4,
-	two			int4,
-	four		int4,
-	ten			int4,
-	twenty		int4,
-	hundred		int4,
-	thousand	int4,
-	twothousand	int4,
-	fivethous	int4,
-	tenthous	int4,
-	odd			int4,
-	even		int4,
-	stringu1	name,
-	stringu2	name,
-	string4		name
-);
-CREATE TABLE tenk2 (
-	unique1 	int4,
-	unique2 	int4,
-	two 	 	int4,
-	four 		int4,
-	ten			int4,
-	twenty 		int4,
-	hundred 	int4,
-	thousand 	int4,
-	twothousand int4,
-	fivethous 	int4,
-	tenthous	int4,
-	odd			int4,
-	even		int4,
-	stringu1	name,
-	stringu2	name,
-	string4		name
-);
-CREATE TABLE person (
-	name 		text,
-	age			int4,
-	location 	point
-);
-CREATE TABLE emp (
-	salary 		int4,
-	manager 	name
-) INHERITS (person);
-CREATE TABLE student (
-	gpa 		float8
-) INHERITS (person);
-CREATE TABLE stud_emp (
-	percent 	int4
-) INHERITS (emp, student);
-NOTICE:  merging multiple inherited definitions of column "name"
-NOTICE:  merging multiple inherited definitions of column "age"
-NOTICE:  merging multiple inherited definitions of column "location"
-CREATE TABLE city (
-	name		name,
-	location 	box,
-	budget 		city_budget
-);
-CREATE TABLE dept (
-	dname		name,
-	mgrname 	text
-);
-CREATE TABLE slow_emp4000 (
-	home_base	 box
-);
-CREATE TABLE fast_emp4000 (
-	home_base	 box
-);
-CREATE TABLE road (
-	name		text,
-	thepath 	path
-);
-CREATE TABLE ihighway () INHERITS (road);
-CREATE TABLE shighway (
-	surface		text
-) INHERITS (road);
-CREATE TABLE real_city (
-	pop			int4,
-	cname		text,
-	outline 	path
-);
---
--- test the "star" operators a bit more thoroughly -- this time,
--- throw in lots of NULL fields...
---
--- a is the type root
--- b and c inherit from a (one-level single inheritance)
--- d inherits from b and c (two-level multiple inheritance)
--- e inherits from c (two-level single inheritance)
--- f inherits from e (three-level single inheritance)
---
-CREATE TABLE a_star (
-	class		char,
-	a 			int4
-);
-CREATE TABLE b_star (
-	b 			text
-) INHERITS (a_star);
-CREATE TABLE c_star (
-	c 			name
-) INHERITS (a_star);
-CREATE TABLE d_star (
-	d 			float8
-) INHERITS (b_star, c_star);
-NOTICE:  merging multiple inherited definitions of column "class"
-NOTICE:  merging multiple inherited definitions of column "a"
-CREATE TABLE e_star (
-	e 			int2
-) INHERITS (c_star);
-CREATE TABLE f_star (
-	f 			polygon
-) INHERITS (e_star);
-CREATE TABLE aggtest (
-	a 			int2,
-	b			float4
-);
-CREATE TABLE hash_i4_heap (
-	seqno 		int4,
-	random 		int4
-);
-CREATE TABLE hash_name_heap (
-	seqno 		int4,
-	random 		name
-);
-CREATE TABLE hash_txt_heap (
-	seqno 		int4,
-	random 		text
-);
-CREATE TABLE hash_f8_heap (
-	seqno		int4,
-	random 		float8
-);
--- don't include the hash_ovfl_heap stuff in the distribution
--- the data set is too large for what it's worth
---
--- CREATE TABLE hash_ovfl_heap (
---	x			int4,
---	y			int4
--- );
-CREATE TABLE bt_i4_heap (
-	seqno 		int4,
-	random 		int4
-);
-CREATE TABLE bt_name_heap (
-	seqno 		name,
-	random 		int4
-);
-CREATE TABLE bt_txt_heap (
-	seqno 		text,
-	random 		int4
-);
-CREATE TABLE bt_f8_heap (
-	seqno 		float8,
-	random 		int4
-);
-CREATE TABLE array_op_test (
-	seqno		int4,
-	i			int4[],
-	t			text[]
-);
-CREATE TABLE array_index_op_test (
-	seqno		int4,
-	i			int4[],
-	t			text[]
-);
-CREATE TABLE testjsonb (
-       j jsonb
-);
+-- Error cases
 CREATE TABLE unknowntab (
 	u unknown    -- fail
 );
@@ -207,14 +10,6 @@ CREATE TYPE unknown_comptype AS (
 	u unknown    -- fail
 );
 ERROR:  column "u" has pseudo-type unknown
-CREATE TABLE IF NOT EXISTS test_tsvector(
-	t text,
-	a tsvector
-);
-CREATE TABLE IF NOT EXISTS test_tsvector(
-	t text
-);
-NOTICE:  relation "test_tsvector" already exists, skipping
 -- invalid: non-lowercase quoted reloptions identifiers
 CREATE TABLE tas_case WITH ("Fillfactor" = 10) AS SELECT 1 a;
 ERROR:  unrecognized parameter "Fillfactor"
@@ -358,14 +153,6 @@ CREATE TABLE partitioned (
 	a2 int
 ) PARTITION BY LIST (a1, a2);	-- fail
 ERROR:  cannot use "list" partition strategy with more than one column
--- unsupported constraint type for partitioned tables
-CREATE TABLE partitioned (
-	a int,
-	EXCLUDE USING gist (a WITH &&)
-) PARTITION BY RANGE (a);
-ERROR:  exclusion constraints are not supported on partitioned tables
-LINE 3:  EXCLUDE USING gist (a WITH &&)
-         ^
 -- prevent using prohibited expressions in the key
 CREATE FUNCTION retset (a int) RETURNS SETOF int AS $$ SELECT 1; $$ LANGUAGE SQL IMMUTABLE;
 CREATE TABLE partitioned (
@@ -780,14 +567,20 @@ CREATE TABLE hash_parted (
 CREATE TABLE hpart_1 PARTITION OF hash_parted FOR VALUES WITH (MODULUS 10, REMAINDER 0);
 CREATE TABLE hpart_2 PARTITION OF hash_parted FOR VALUES WITH (MODULUS 50, REMAINDER 1);
 CREATE TABLE hpart_3 PARTITION OF hash_parted FOR VALUES WITH (MODULUS 200, REMAINDER 2);
+CREATE TABLE hpart_4 PARTITION OF hash_parted FOR VALUES WITH (MODULUS 10, REMAINDER 3);
 -- modulus 25 is factor of modulus of 50 but 10 is not a factor of 25.
 CREATE TABLE fail_part PARTITION OF hash_parted FOR VALUES WITH (MODULUS 25, REMAINDER 3);
 ERROR:  every hash partition modulus must be a factor of the next larger modulus
-DETAIL:  The new modulus 25 is not divisible by 10, the modulus of existing partition "hpart_1".
+DETAIL:  The new modulus 25 is not divisible by 10, the modulus of existing partition "hpart_4".
 -- previous modulus 50 is factor of 150 but this modulus is not a factor of next modulus 200.
 CREATE TABLE fail_part PARTITION OF hash_parted FOR VALUES WITH (MODULUS 150, REMAINDER 3);
 ERROR:  every hash partition modulus must be a factor of the next larger modulus
 DETAIL:  The new modulus 150 is not a factor of 200, the modulus of existing partition "hpart_3".
+-- overlapping remainders
+CREATE TABLE fail_part PARTITION OF hash_parted FOR VALUES WITH (MODULUS 100, REMAINDER 3);
+ERROR:  partition "fail_part" would overlap partition "hpart_4"
+LINE 1: ...BLE fail_part PARTITION OF hash_parted FOR VALUES WITH (MODU...
+                                                             ^
 -- trying to specify range for the hash partitioned table
 CREATE TABLE fail_part PARTITION OF hash_parted FOR VALUES FROM ('a', 1) TO ('z');
 ERROR:  invalid bound specification for a hash partition
@@ -928,7 +721,7 @@ LINE 1: ...LE fail_part PARTITION OF hash_parted2 FOR VALUES WITH (MODU...
                                                              ^
 -- modulus must be greater than zero
 CREATE TABLE fail_part PARTITION OF hash_parted2 FOR VALUES WITH (MODULUS 0, REMAINDER 1);
-ERROR:  modulus for hash partition must be a positive integer
+ERROR:  modulus for hash partition must be an integer value greater than zero
 -- remainder must be greater than or equal to zero and less than modulus
 CREATE TABLE fail_part PARTITION OF hash_parted2 FOR VALUES WITH (MODULUS 8, REMAINDER 8);
 ERROR:  remainder for hash partition must be less than modulus
@@ -965,22 +758,24 @@ CREATE TABLE part_b PARTITION OF parted (
 ) FOR VALUES IN ('b');
 NOTICE:  merging constraint "check_a" with inherited definition
 -- conislocal should be false for any merged constraints, true otherwise
-SELECT conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_b'::regclass ORDER BY conislocal, coninhcount;
- conislocal | coninhcount 
-------------+-------------
- f          |           1
- t          |           0
-(2 rows)
+SELECT conname, conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_b'::regclass ORDER BY coninhcount DESC, conname;
+      conname      | conislocal | coninhcount 
+-------------------+------------+-------------
+ check_a           | f          |           1
+ part_b_b_not_null | t          |           1
+ check_b           | t          |           0
+(3 rows)
 
 -- Once check_b is added to the parent, it should be made non-local for part_b
 ALTER TABLE parted ADD CONSTRAINT check_b CHECK (b >= 0);
 NOTICE:  merging constraint "check_b" with inherited definition
-SELECT conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_b'::regclass;
- conislocal | coninhcount 
-------------+-------------
- f          |           1
- f          |           1
-(2 rows)
+SELECT conname, conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_b'::regclass ORDER BY coninhcount DESC, conname;
+      conname      | conislocal | coninhcount 
+-------------------+------------+-------------
+ check_a           | f          |           1
+ check_b           | f          |           1
+ part_b_b_not_null | t          |           1
+(3 rows)
 
 -- Neither check_a nor check_b are droppable from part_b
 ALTER TABLE part_b DROP CONSTRAINT check_a;
@@ -991,10 +786,11 @@ ERROR:  cannot drop inherited constraint "check_b" of relation "part_b"
 -- traditional inheritance where they will be left behind, because they would
 -- be local constraints.
 ALTER TABLE parted DROP CONSTRAINT check_a, DROP CONSTRAINT check_b;
-SELECT conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_b'::regclass;
- conislocal | coninhcount 
-------------+-------------
-(0 rows)
+SELECT conname, conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_b'::regclass ORDER BY coninhcount DESC, conname;
+      conname      | conislocal | coninhcount 
+-------------------+------------+-------------
+ part_b_b_not_null | t          |           1
+(1 row)
 
 -- specify PARTITION BY for a partition
 CREATE TABLE fail_part_col_not_found PARTITION OF parted FOR VALUES IN ('c') PARTITION BY RANGE (c);
@@ -1010,7 +806,7 @@ create table parted_notnull_inh_test1 partition of parted_notnull_inh_test (a no
 insert into parted_notnull_inh_test (b) values (null);
 ERROR:  null value in column "b" of relation "parted_notnull_inh_test1" violates not-null constraint
 DETAIL:  Failing row contains (1, null).
--- note that while b's default is overriden, a's default is preserved
+-- note that while b's default is overridden, a's default is preserved
 \d parted_notnull_inh_test1
       Table "public.parted_notnull_inh_test1"
  Column |  Type   | Collation | Nullable | Default 
@@ -1058,6 +854,8 @@ drop table test_part_coll_posix;
  b      | integer |           | not null | 1       | plain    |              | 
 Partition of: parted FOR VALUES IN ('b')
 Partition constraint: ((a IS NOT NULL) AND (a = 'b'::text))
+Not-null constraints:
+    "part_b_b_not_null" NOT NULL "b" (local, inherited)
 
 -- Both partition bound and partition key in describe output
 \d+ part_c
@@ -1069,6 +867,8 @@ Partition constraint: ((a IS NOT NULL) AND (a = 'b'::text))
 Partition of: parted FOR VALUES IN ('c')
 Partition constraint: ((a IS NOT NULL) AND (a = 'c'::text))
 Partition key: RANGE (b)
+Not-null constraints:
+    "part_c_b_not_null" NOT NULL "b" (local, inherited)
 Partitions: part_c_1_10 FOR VALUES FROM (1) TO (10)
 
 -- a level-2 partition's constraint will include the parent's expressions
@@ -1080,6 +880,8 @@ Partitions: part_c_1_10 FOR VALUES FROM (1) TO (10)
  b      | integer |           | not null | 0       | plain    |              | 
 Partition of: part_c FOR VALUES FROM (1) TO (10)
 Partition constraint: ((a IS NOT NULL) AND (a = 'c'::text) AND (b IS NOT NULL) AND (b >= 1) AND (b < 10))
+Not-null constraints:
+    "part_c_b_not_null" NOT NULL "b" (inherited)
 
 -- Show partition count in the parent's describe output
 -- Tempted to include \d+ output listing partitions with bound info but
@@ -1100,7 +902,7 @@ Number of partitions: 3 (Use \d+ to list them.)
 --------+---------+-----------+----------+---------
  a      | integer |           |          | 
 Partition key: HASH (a)
-Number of partitions: 3 (Use \d+ to list them.)
+Number of partitions: 4 (Use \d+ to list them.)
 
 -- check that we get the expected partition constraints
 CREATE TABLE range_parted4 (a int, b int, c int) PARTITION BY RANGE (abs(a), abs(b), c);
@@ -1186,6 +988,10 @@ Partition key: LIST (a)
 Number of partitions: 0
 
 DROP TABLE parted_col_comment;
+-- specifying storage parameters for partitioned tables is not supported
+CREATE TABLE parted_col_comment (a int, b text) PARTITION BY LIST (a) WITH (fillfactor=100);
+ERROR:  cannot specify storage parameters for a partitioned table
+HINT:  Specify storage parameters for its leaf partitions instead.
 -- list partitioning on array type column
 CREATE TABLE arrlp (a int[]) PARTITION BY LIST (a);
 CREATE TABLE arrlp12 PARTITION OF arrlp FOR VALUES IN ('{1}', '{2}');
