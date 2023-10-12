@@ -994,7 +994,8 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 										  allowSystemTableMods,
 										  false,
 										  InvalidOid,
-										  typaddress);
+										  typaddress,
+										  stmt->is_immutable);
 
 	/*
 	 * We must bump the command counter to make the newly-created relation
