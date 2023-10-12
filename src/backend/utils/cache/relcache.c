@@ -1137,6 +1137,7 @@ retry:
 	relation->rd_newRelfilelocatorSubid = InvalidSubTransactionId;
 	relation->rd_firstRelfilelocatorSubid = InvalidSubTransactionId;
 	relation->rd_droppedSubid = InvalidSubTransactionId;
+	relation->is_immutable = relp->relisimmutable;
 	switch (relation->rd_rel->relpersistence)
 	{
 		case RELPERSISTENCE_UNLOGGED:

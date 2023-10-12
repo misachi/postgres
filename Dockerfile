@@ -15,11 +15,11 @@ RUN apt-get update && apt-get install -y g++ \
             tar gzip \
             git \
             libreadline-dev \
-            flex bison 
+            flex bison libicu-dev
             # libxml2-dev libxslt-dev libssl-dev libxml2-utils xsltproc ccache
 
 # RUN git clone https://github.com/misachi/postgres.git
-RUN ./configure && \
+RUN ./configure --without-icu && \
         make  && \
         make all && \
         make install

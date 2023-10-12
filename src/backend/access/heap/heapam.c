@@ -2524,6 +2524,11 @@ heap_delete(Relation relation, ItemPointer tid,
 	HeapTuple	old_key_tuple = NULL;	/* replica identity of the tuple */
 	bool		old_key_copied = false;
 
+	if (relation->is_immutable)
+		ereport(ERROR,
+				(errcode(ERRCODE_IMMUTABLE_TABLE_UPDATE),
+				 errmsg("cannot update immutable table")));
+
 	Assert(ItemPointerIsValid(tid));
 
 	/*
@@ -3009,6 +3014,11 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 				infomask2_old_tuple,
 				infomask_new_tuple,
 				infomask2_new_tuple;
+	
+	if (relation->is_immutable)
+		ereport(ERROR,
+				(errcode(ERRCODE_IMMUTABLE_TABLE_UPDATE),
+				 errmsg("cannot update immutable table")));
 
 	Assert(ItemPointerIsValid(otid));
 
