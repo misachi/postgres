@@ -379,6 +379,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <node>	TriggerWhen
 %type <str>		TransitionRelName
 %type <boolean>	TransitionRowOrTable TransitionOldOrNew
+%type <boolean> IsTableImmutable
 %type <node>	TriggerTransition
 
 %type <list>	event_trigger_when_list event_trigger_value_list
@@ -607,6 +608,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <str>		OptTableSpace OptConsTableSpace
 %type <rolespec> OptTableSpaceOwner
 %type <ival>	opt_check_option
+%type <boolean>	OptImmutable
 
 %type <str>		opt_provider security_label
 
@@ -717,7 +719,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 	HANDLER HAVING HEADER_P HOLD HOUR_P
 
-	IDENTITY_P IF_P ILIKE IMMEDIATE IMMUTABLE IMPLICIT_P IMPORT_P IN_P INCLUDE
+	IDENTITY_P IF_P ILIKE IMMEDIATE IMMUTABLE ISIMMUTABLETABLE IMPLICIT_P IMPORT_P IN_P INCLUDE
 	INCLUDING INCREMENT INDENT INDEX INDEXES INHERIT INHERITS INITIALLY INLINE_P
 	INNER_P INOUT INPUT_P INSENSITIVE INSERT INSTEAD INT_P INTEGER
 	INTERSECT INTERVAL INTO INVOKER IS ISNULL ISOLATION
@@ -732,7 +734,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	LOCALTIME LOCALTIMESTAMP LOCATION LOCK_P LOCKED LOGGED
 
 	MAPPING MATCH MATCHED MATERIALIZED MAXVALUE MERGE METHOD
-	MINUTE_P MINVALUE MODE MONTH_P MOVE
+	MINUTE_P MINVALUE MODE MONTH_P MOVE MUTABLE
 
 	NAME_P NAMES NATIONAL NATURAL NCHAR NEW NEXT NFC NFD NFKC NFKD NO NONE
 	NORMALIZE NORMALIZED
@@ -3505,7 +3507,7 @@ copy_generic_opt_arg_list_item:
 
 CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 			OptInherit OptPartitionSpec table_access_method_clause OptWith
-			OnCommitOption OptTableSpace
+			OnCommitOption OptTableSpace OptImmutable
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
@@ -3521,11 +3523,12 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $12;
 					n->tablespacename = $13;
 					n->if_not_exists = false;
+					n->is_immutable = $14;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name '('
 			OptTableElementList ')' OptInherit OptPartitionSpec table_access_method_clause
-			OptWith OnCommitOption OptTableSpace
+			OptWith OnCommitOption OptTableSpace OptImmutable
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
@@ -3541,11 +3544,12 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $15;
 					n->tablespacename = $16;
 					n->if_not_exists = true;
+					n->is_immutable = $17;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE qualified_name OF any_name
 			OptTypedTableElementList OptPartitionSpec table_access_method_clause
-			OptWith OnCommitOption OptTableSpace
+			OptWith OnCommitOption OptTableSpace OptImmutable
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
@@ -3562,11 +3566,12 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $11;
 					n->tablespacename = $12;
 					n->if_not_exists = false;
+					n->is_immutable = $13;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name OF any_name
 			OptTypedTableElementList OptPartitionSpec table_access_method_clause
-			OptWith OnCommitOption OptTableSpace
+			OptWith OnCommitOption OptTableSpace OptImmutable
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
@@ -3583,11 +3588,12 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $14;
 					n->tablespacename = $15;
 					n->if_not_exists = true;
+					n->is_immutable = $16;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE qualified_name PARTITION OF qualified_name
 			OptTypedTableElementList PartitionBoundSpec OptPartitionSpec
-			table_access_method_clause OptWith OnCommitOption OptTableSpace
+			table_access_method_clause OptWith OnCommitOption OptTableSpace OptImmutable
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
@@ -3604,11 +3610,12 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $13;
 					n->tablespacename = $14;
 					n->if_not_exists = false;
+					n->is_immutable = $15;
 					$$ = (Node *) n;
 				}
 		| CREATE OptTemp TABLE IF_P NOT EXISTS qualified_name PARTITION OF
 			qualified_name OptTypedTableElementList PartitionBoundSpec OptPartitionSpec
-			table_access_method_clause OptWith OnCommitOption OptTableSpace
+			table_access_method_clause OptWith OnCommitOption OptTableSpace OptImmutable
 				{
 					CreateStmt *n = makeNode(CreateStmt);
 
@@ -3625,6 +3632,7 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
 					n->oncommit = $16;
 					n->tablespacename = $17;
 					n->if_not_exists = true;
+					n->is_immutable = $18;
 					$$ = (Node *) n;
 				}
 		;
@@ -5916,6 +5924,16 @@ TransitionOldOrNew:
 			| OLD									{ $$ = false; }
 		;
 
+IsTableImmutable:
+			MUTABLE										{ $$ = false; }
+			| IMMUTABLE									{ $$ = true; }
+		;
+
+OptImmutable:
+			ISIMMUTABLETABLE IsTableImmutable 		{ $$ =  $2;}
+			| /* EMPTY */                           { $$ = NULL; }
+		;
+
 TransitionRowOrTable:
 			TABLE									{ $$ = true; }
 			/*
@@ -7695,6 +7713,7 @@ privilege_target:
 					n->objs = $2;
 					$$ = n;
 				}
+
 			| TYPE_P any_name_list
 				{
 					PrivTarget *n = (PrivTarget *) palloc(sizeof(PrivTarget));
@@ -11193,6 +11212,7 @@ createdb_opt_name:
 			| OWNER							{ $$ = pstrdup($1); }
 			| TABLESPACE					{ $$ = pstrdup($1); }
 			| TEMPLATE						{ $$ = pstrdup($1); }
+/***			| ISIMMUTABLETABLE              { $$ = pstrdup($1); } */
 		;
 
 /*
@@ -17152,6 +17172,7 @@ unreserved_keyword:
 			| INSERT
 			| INSTEAD
 			| INVOKER
+			| ISIMMUTABLETABLE
 			| ISOLATION
 			| KEY
 			| KEYS
@@ -17180,6 +17201,7 @@ unreserved_keyword:
 			| MODE
 			| MONTH_P
 			| MOVE
+			| MUTABLE
 			| NAME_P
 			| NAMES
 			| NEW
@@ -17727,6 +17749,7 @@ bare_label_keyword:
 			| INTERVAL
 			| INVOKER
 			| IS
+			| ISIMMUTABLETABLE
 			| ISOLATION
 			| JOIN
 			| JSON
@@ -17768,6 +17791,7 @@ bare_label_keyword:
 			| MINVALUE
 			| MODE
 			| MOVE
+			| MUTABLE
 			| NAME_P
 			| NAMES
 			| NATIONAL
